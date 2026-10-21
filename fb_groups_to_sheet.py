@@ -511,6 +511,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=80, help="حجم دفعة الإرسال للشيت لما التعليقات تبقى بالآلاف")
     parser.add_argument("--debug", action="store_true",
                         help="سجّل الكونسول والأخطاء والشبكة، واحفظ HTML وصورة في debug/ لو حصل خطأ")
+    parser.add_argument("--trace", action="store_true",
+                        help="مع --debug: سجّل كمان trace.zip و network.har (أتقل، بس بيوريك كل خطوة)")
     args = parser.parse_args()
     if args.min_posts < 1 or args.max_posts < args.min_posts:
         raise SystemExit("min-posts لازم يكون 1 أو أكتر، وmax-posts أكبر منه أو يساويه")
@@ -534,7 +536,7 @@ def main() -> None:
         if args.debug:
             from browser_debug import PageRecorder
 
-            recorder = PageRecorder(page, label="scrape")
+            recorder = PageRecorder(page, label="scrape", trace=args.trace, har=args.trace)
         try:
             for url in args.group:
                 if recorder:

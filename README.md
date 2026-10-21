@@ -122,12 +122,40 @@ $env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
 .venv\Scripts\python.exe fb_return_replies.py --debug
 ```
 
+**أول أمر تشغّله لما السحب يبوظ** — بيختبر كل selector المشروع معتمد عليه على صفحة
+حقيقية ويقول كل واحد لقى كام عنصر:
+
+```powershell
+.venv\Scripts\python.exe browser_debug.py selectors --url "https://www.facebook.com/groups/123/posts/456/"
+```
+
+كل selector مصنّف:
+
+| التصنيف | معنى الصفر |
+| --- | --- |
+| `critical` | السحب أو الرد واقف. لازم إصلاح |
+| `degraded` | ماشي بس ناقص — في fallback |
+| `context` | طبيعي حسب الصفحة أو حالتها. مش مشكلة |
+
+الأمر بيرجع exit code 1 لو حاجة `critical` بارت، فينفع في سكربت أو CI.
+وبيعرف نوع الصفحة من الرابط، فالـ probes اللي مش بتاعتها بتتعلّم «مش بتاع الصفحة دي».
+
 لقطة يدوية، أو مراقبة لايف:
 
 ```powershell
 .venv\Scripts\python.exe browser_debug.py snapshot
 .venv\Scripts\python.exe browser_debug.py snapshot --url "https://www.facebook.com/groups/123"
 .venv\Scripts\python.exe browser_debug.py watch
+```
+
+تتبّع كامل وشبكة كاملة — ينفع مع أي أمر فوق أو مع `--debug` في السكربتات:
+
+```powershell
+.venv\Scripts\python.exe browser_debug.py --trace --har snapshot --url URL
+.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL ... --debug --trace
+
+# افتح التتبّع: فيه كل خطوة بصورتها و DOM بتاعها
+.venv\Scripts\python.exe -m playwright show-trace "debug\...\trace.zip"
 ```
 
 كل لقطة بتروح في `debug/<الوقت>-<اسم>-<سبب>/` وفيها:
@@ -143,6 +171,10 @@ $env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
 | `network.jsonl` | الطلبات الفاشلة والردود 4xx/5xx |
 | `browser-log.jsonl` | سجل المتصفح من CDP: CORS، CSP، أمان |
 | `storage.json` | localStorage و sessionStorage |
+| `selectors.json` / `.txt` | حالة كل selector المشروع معتمد عليه |
+| `perf.json` | عدّادات الأداء من CDP (`Performance.getMetrics`) |
+| `trace.zip` | تتبّع Playwright كامل — بـ `--trace` |
+| `network.har` | كل الشبكة بصيغة HAR — بـ `--har` |
 | `meta.json` | الرابط، العنوان، الـ viewport، عدد الكوكيز، الاستثناء |
 
 الكوكيز بتتسجّل **بأسمائها ونطاقاتها بس، من غير قيم** — القيم بتساوي الجلسة نفسها.
@@ -157,6 +189,23 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
     page.goto(url)
     rec.mark("after-goto")
 ```
+
+### Chrome DevTools MCP
+
+`.mcp.json` فيه سيرفر [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)
+موصّل على نفس المتصفح (`--browser-url=http://127.0.0.1:9333`)، فأداة الذكاء الاصطناعي
+تقدر تقرأ الكونسول والشبكة وتسجّل performance traces وتاخد صور من غير ما تكتب سكربت.
+
+أول مرة لازم توافق عليه: شغّل `claude` في مجلد المشروع ووافق على السيرفر.
+محتاج Node ≥ 23 (`node --version`).
+
+> السيرفر بيوصل للمتصفح المسجّل دخوله على فيسبوك. وافق عليه وإنت عارف ده.
+
+### ليه مفيش stealth plugins
+
+المشروع بيستخدم كروم حقيقي، ببروفايل حقيقي ثابت، متحكَّم فيه بـ CDP — وده أصلًا
+أقل حاجة بتبان. حِزَم الـ stealth بتعالج بصمة المتصفحات الـ headless، وإحنا
+مش بنستخدم headless، فمفيش منها فايدة هنا.
 
 ---
 

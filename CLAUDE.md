@@ -89,7 +89,10 @@ python -m venv .venv
 التشخيص بيوصل لده في خطوة واحدة:
 
 ```powershell
-# دَمب تلقائي عند أي فشل أثناء الشغل
+# ابدأ من هنا: إيه اللي بار في الـ DOM؟
+.venv\Scripts\python.exe browser_debug.py selectors --url "https://www.facebook.com/groups/G/posts/P/"
+
+# دَمب تلقائي عند أي فشل أثناء الشغل (زوّد --trace لتتبّع كامل + HAR)
 .venv\Scripts\python.exe fb_groups_to_sheet.py --group URL ... --debug
 .venv\Scripts\python.exe fb_return_replies.py --debug
 
@@ -119,6 +122,12 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
 `PageRecorder.dump()` **مابيرفعش استثناء أبدًا** — لازم يفضل يشتغل والصفحة بايظة.
 لما تزوّد التقاط جديد، حافظ على الخاصية دي.
 
+جدول الـ selectors كله في `PROBES` في `browser_debug.py`. **أي selector جديد يتضاف
+في الكود، لازم يتضاف هناك كمان** — ده اللي بيخلي الفحص يفضل نافع.
+
+`--trace` / `--har` على مستوى الـ context مش الصفحة، فمسجّل واحد بس بياخدهم
+في نفس الوقت. في `watch` أول تاب بس هو اللي بياخدهم.
+
 ## أسرار
 
 `TOKEN` ورابط الـ Apps Script `/exec` **مكتوبين في الكود** في
@@ -130,6 +139,36 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
 ---
 
 ## سجل التحديثات
+
+### 2026-10-21 — فحص selectors، تتبّع Playwright، HAR، و MCP
+- **`browser_debug.py selectors` جديد** — بيختبر 20 selector المشروع معتمد عليها على
+  صفحة حقيقية ويقول كل واحد لقى كام عنصر، مصنّفين `critical` / `degraded` / `context`،
+  وبيستنتج نوع الصفحة (post / feed) من الرابط فيتجاهل اللي مش بتاعها.
+  exit code 1 لو حاجة `critical` بارت.
+  **ليه:** فشل السحب بيطلع كـ `no-comment` أو `no-reply-button` من غير دليل. الأمر ده
+  بيحوّل التخمين لسطر واحد محدد.
+- **تتبّع Playwright و HAR اتفعلوا.** متأكد عمليًا إن `tracing.start()` و
+  `tracing.start_har()` (1.60+) **بيشتغلوا فوق `connect_over_cdp`** على 1.64 —
+  `trace.zip` طلع 110KB بـ 6 فريمات صور و DOM snapshot و stacks و sources.
+  حد معروف: الخطوات اللي بتتعمل بـ CDP خام مش بتظهر في الخط الزمني، لكن خطوات
+  Playwright (goto/click/evaluate) بتظهر — وده اللي السكربتات بتستخدمه.
+  كل دَمب بياخد trace chunk لوحده (`start_chunk`/`stop_chunk`) فالدمبات المتعددة
+  في `fb_return_replies.py` كل واحد ليه تتبّعه.
+- **`perf.json`** من `Performance.getMetrics` عبر CDP (36 عدّاد).
+- **`--trace` في السكربتين** (مع `--debug`).
+- **`.mcp.json`**: سيرفر `chrome-devtools-mcp` موصّل على `--browser-url=http://127.0.0.1:9333`.
+  محتاج موافقة تفاعلية أول مرة (`claude` في مجلد المشروع). Node ≥ 23.
+- **`page.accessibility` مابقاش موجود** في Playwright Python 1.64 — ماتستخدمهوش.
+
+نتايج بحث تخص المشروع:
+- **Facebook Groups API ميّت خلاص.** اتشال من Graph API v19 في 23 يناير 2024،
+  واتمسح من كل النسخ في 22 أبريل 2024، ولسه مش موجود في v26 (أكتوبر 2026).
+  `publish_to_groups` و `groups_access_member_info` اتشالوا كمان. يعني **مفيش بديل
+  رسمي** لقراءة منشورات وتعليقات الجروبات — أتوماتة المتصفح هي الطريق الوحيد،
+  وده بيثبت إن معمارية المشروع صح.
+- **مفيش stealth plugins بقصد.** كروم حقيقي + بروفايل ثابت + CDP = أقل بصمة أصلًا.
+  حِزَم الـ stealth بتعالج بصمة الـ headless، وإحنا مش headless.
+- مفيش `pytest-playwright` لحد ما يبقى في اختبارات تستاهل.
 
 ### 2026-10-21 — فرع `dev` للشغل
 - **فرع `dev`** اتعمل من `3c1a6b9`، وبقى هو مكان كل الـ commits والـ pushes الجديدة.

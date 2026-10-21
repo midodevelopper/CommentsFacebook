@@ -74,6 +74,8 @@ def main() -> None:
     parser.add_argument("--cdp", default=CDP)
     parser.add_argument("--debug", action="store_true",
                         help="احفظ HTML وصورة وكونسول في debug/ لأي رد مانجحش")
+    parser.add_argument("--trace", action="store_true",
+                        help="مع --debug: سجّل كمان trace.zip و network.har")
     args = parser.parse_args()
 
     data = sheet_get("pending_replies")
@@ -92,7 +94,7 @@ def main() -> None:
         if args.debug:
             from browser_debug import PageRecorder
 
-            recorder = PageRecorder(page, label="replies")
+            recorder = PageRecorder(page, label="replies", trace=args.trace, har=args.trace)
         try:
             for item in replies:
                 if recorder:
