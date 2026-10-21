@@ -55,7 +55,7 @@ def test_defaults():
 @pytest.mark.unit
 def test_probes_are_well_formed():
     names = [p["name"] for p in bd.PROBES]
-    assert len(names) == len(set(names)) == 27
+    assert len(names) == len(set(names)) == 29
     for p in bd.PROBES:
         assert p["kind"] in ("css", "role", "text")
         assert p["tier"] in ("critical", "degraded", "context")
@@ -94,7 +94,8 @@ def test_every_selector_used_in_code_is_in_probes():
     for name in ("fb_groups_to_sheet.py", "fb_return_replies.py"):
         used |= _js_selectors((ROOT / name).read_text(encoding="utf-8"))
     normalized = {s.replace('"', "'") for s in probes}
-    absent = {s.replace('"', "'") for s in used} - normalized - {"div"}   # 'div' = generic scroll search
+    # 'div' = generic scroll search; data-hermes-* = our own markers (fb_return_replies), not Facebook's DOM
+    absent = {s.replace('"', "'") for s in used if "data-hermes-" not in s} - normalized - {"div"}
     assert absent == set()
 
 
@@ -371,7 +372,8 @@ def test_probe_on_healthy_post_page(page, fake_fb):
 
 @pytest.mark.browser
 def test_probe_flags_broken_critical_and_sort(page, fake_fb):
-    fake_fb.add_group(Group(G), [Post("77", comments=[], sort_mode="none")])
+    # genuinely broken: no comments rendered AND no "no comments yet" text (D-32 would excuse that)
+    fake_fb.add_group(Group(G), [Post("77", comments=[], sort_mode="none", no_comments_text=False)])
     page.goto(f"https://www.facebook.com/groups/{G}/posts/77/")
     report = bd.probe_selectors(page)
     assert {"comment.article", "comment.permalink", "reply.button"} <= set(report["critical_zero"])
@@ -516,3 +518,60 @@ def test_perf_counters_cover_the_session(page, isolated_output_dirs):
     perf = json.loads((out / "perf.json").read_text(encoding="utf-8"))
     assert perf["LayoutCount"] > 0
     rec.detach()
+
+
+
+@pytest.mark.browser
+def test_cdp_exception_keeps_the_real_message(page):
+    """Fixed D-28 (seen live): Runtime.exceptionThrown was stored as just 'Uncaught'."""
+    rec = bd.PageRecorder(page, label="t")
+    page.set_content("<script>setTimeout(() => { throw new TypeError('real reason here') }, 0)</script>")
+    assert wait_for(page, lambda: any(e["kind"] == "exceptionThrown" for e in rec.errors))
+    thrown = next(e for e in rec.errors if e["kind"] == "exceptionThrown")
+    assert "TypeError: real reason here" in thrown["message"]
+    rec.detach()
+
+
+@pytest.mark.browser
+def test_probe_no_comments_post_is_not_reported_broken(page, fake_fb):
+    """Fixed D-32 (seen live: 8 of 11 healthy posts reported critical): Facebook's 'no comments yet'
+    makes zero comment/reply/sort selectors expected."""
+    fake_fb.add_group(Group(G), [Post("77", comments=[], sort_mode="none")])
+    page.goto(f"https://www.facebook.com/groups/{G}/posts/77/")
+    report = bd.probe_selectors(page)
+    assert report["no_comments"] is True
+    assert report["critical_zero"] == [] and report["sort_broken"] is False
+
+
+@pytest.mark.browser
+def test_probe_still_flags_zero_comments_without_the_text(page, fake_fb):
+    fake_fb.add_group(Group(G), [Post("77", comments=[], sort_mode="none", no_comments_text=False)])
+    page.goto(f"https://www.facebook.com/groups/{G}/posts/77/")
+    report = bd.probe_selectors(page)
+    assert report["no_comments"] is False and "comment.article" in report["critical_zero"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text, noise", [
+    ("Error with Permissions-Policy header: Unrecognized feature: 'interest-cohort'.", True),
+    ("Permissions policy violation: unload is not allowed in this document.", True),
+    ("Minified React error #418; visit https://react.dev/errors/418", True),
+    ("net::ERR_ABORTED https://scontent.fjed2-1.fna.fbcdn.net/o1/v/t2/f2/m366/x", True),
+    ("TypeError: Cannot read properties of undefined", False),
+    ("net::ERR_ABORTED https://www.facebook.com/api/graphql/", False),
+    ("", False),
+    (None, False),
+])
+def test_known_noise(text, noise):
+    assert bd.is_known_noise(text) is noise
+
+
+@pytest.mark.unit
+def test_summary_counts_noise_and_lists_only_anomalies(isolated_output_dirs):
+    rec = bd.PageRecorder(page=None, label="n", attach=False)
+    rec._push(rec.console, {"type": "error", "text": "Error with Permissions-Policy header: Unrecognized feature: 'x'."})
+    rec._push(rec.console, {"type": "error", "text": "TypeError: boom"})
+    rec._push(rec.errors, {"kind": "pageerror", "message": "Minified React error #418; visit"})
+    text = rec._summary({"url": "u", "title": "t", "saved_at": "s", "elapsed_sec": 1, "counts": rec.counts()}, "r", None)
+    assert "known Facebook noise (not listed, still in the .jsonl files): 2" in text
+    assert "TypeError: boom" in text and "Permissions-Policy" not in text and "page errors:" not in text

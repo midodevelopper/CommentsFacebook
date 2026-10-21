@@ -580,3 +580,20 @@ def test_scrape_post_zero_comments_without_text_still_stops(page, fake_fb):
     with pytest.raises(SystemExit) as exc:
         scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", no_comments_text=False))
     assert str(exc.value).endswith(": missing")
+
+
+
+def test_snapshot_shared_post_text_kind_and_original_link(page, fake_fb):
+    """Fixed D-27 (seen live): a shared post has no message element and was stored with empty text."""
+    open_post(page, fake_fb, Post("77", message=None, shared_text="سيدة محتاجة سيارة إسعاف", sort_mode="newest",
+                                  comments=[Comment(id="501", text="ربنا يستر")]))
+    snap = scraper.visible_snapshot(page, G, "77")
+    assert snap["content_kind"] == "share"
+    assert snap["text"] == "سيدة محتاجة سيارة إسعاف"                      # not doubled, not a comment
+    assert snap["media_url"] == snap["post_content"] == "https://www.facebook.com/somepage/posts/pfbid0SharedOriginal"
+
+
+def test_snapshot_own_group_links_are_not_shares(page, fake_fb):
+    open_post(page, fake_fb, Post("77", message="منشور عادي", sort_mode="newest",
+                                  comments=[Comment(id="501")]))
+    assert scraper.visible_snapshot(page, G, "77")["content_kind"] == "text"

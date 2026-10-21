@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import re
@@ -176,28 +177,57 @@ def sheet_post_payload(group_id: str, post: dict, comments: list[dict]) -> dict:
     }
 
 
+# Apps Script بيرجّع HTTP 500 عابر أحيانًا (اتشاف في تشغيل حقيقي، والطلب اللي بعده بثانية نجح).
+# إعادة المحاولة آمنة: الشيت بيعمل upsert بـ post_id / comment_id، فمفيش تكرار.
+SHEET_ATTEMPTS = 3
+SHEET_BACKOFF = (5, 15)
+
+
+def apps_script_error(page: str) -> str:
+    """صفحة خطأ Google (HTML تقيل كله سكربتات) -> الرسالة اللي تتقري."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", page or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", html.unescape(text)).strip()
+    return text[:300] or (page or "")[:300]
+
+
 def sheet_post(payload: dict) -> str:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        WEBAPP,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            answer = resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")
-        raise SystemExit(f"الشيت رفض الإرسال HTTP {exc.code}: {detail[:500]}") from exc
-    # Apps Script بيرجّع 200 حتى لو رفض (توكن غلط، خطأ في السكربت، صفحة خطأ HTML)
-    try:
-        parsed = json.loads(answer)
-    except ValueError:
-        raise SystemExit(f"رد الشيت مش JSON — غالبًا صفحة خطأ من Apps Script: {answer[:300]}") from None
-    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
-        raise SystemExit(f"الشيت رفض البيانات: {answer[:300]}")
-    return answer
+    for attempt in range(1, SHEET_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            WEBAPP,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                answer = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            detail = apps_script_error(exc.read().decode("utf-8", "replace"))
+            if exc.code < 500 or attempt == SHEET_ATTEMPTS:
+                raise SystemExit(f"الشيت رفض الإرسال HTTP {exc.code} (محاولة {attempt}): {detail}") from exc
+            problem = f"HTTP {exc.code}: {detail}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            if attempt == SHEET_ATTEMPTS:
+                raise
+            problem = str(exc)
+        else:
+            # Apps Script بيرجّع 200 حتى لو رفض (توكن غلط، خطأ في السكربت، صفحة خطأ HTML)
+            try:
+                parsed = json.loads(answer)
+            except ValueError:
+                raise SystemExit(f"رد الشيت مش JSON — غالبًا صفحة خطأ من Apps Script: {apps_script_error(answer)}") from None
+            if isinstance(parsed, dict) and parsed.get("ok") is True:
+                return answer
+            busy = isinstance(parsed, dict) and "lock" in str(parsed.get("error", "")).lower()
+            if not busy or attempt == SHEET_ATTEMPTS:
+                raise SystemExit(f"الشيت رفض البيانات: {answer[:300]}")
+            problem = f"القفل مشغول: {parsed.get('error')}"
+        wait = SHEET_BACKOFF[min(attempt, len(SHEET_BACKOFF)) - 1]
+        print(f"الشيت مارضيش ({problem[:160]}) — محاولة {attempt + 1} بعد {wait} ثانية", file=sys.stderr)
+        time.sleep(wait)
+    raise AssertionError("unreachable")
 
 
 def own_group_post_id(href: str, group_id: str) -> str | None:
@@ -436,7 +466,24 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
           const msg = scope.querySelector("div[data-ad-preview='message'], div[data-ad-comet-preview='message']");
           const titleParts = (document.title || '').split('|').map(s => s.trim()).filter(s => s && s !== 'Facebook');
           const titleText = titleParts.length >= 2 ? titleParts[titleParts.length - 1] : '';
-          const text = msg ? msg.innerText.trim() : titleText;
+          // منشور متشارك: رابط لمنشور جهة تانية (صفحة/حساب)، ومفيش data-ad-preview للنص
+          const sharedLink = [...scope.querySelectorAll("a[href*='/posts/'], a[href*='permalink.php'], a[href*='story_fbid=']")]
+            .map(a => a.href)
+            .find(h => !h.includes(`/groups/${groupId}/`) && !h.includes('multi_permalinks') && !h.includes('comment_id=')) || '';
+          let text = msg ? msg.innerText.trim() : '';
+          if (!text && sharedLink) {
+            const skip = new RegExp(ids.noComments + '|·');
+            const candidates = [...scope.querySelectorAll("div[dir='auto'], span[dir='auto']")]
+              .filter(n => !n.closest("[role='article'][aria-label]"))     // التعليقات جوه article المنشور
+              .map(n => (n.innerText || '').trim())
+              .filter(t => t && t !== author && !skip.test(t));
+            let best = candidates.sort((a, b) => b.length - a.length)[0] || '';
+            // فيسبوك بيرسم النص مرتين (الظاهر + نسخة «عرض المزيد») جوه نفس العنصر
+            const half = best.length / 2;
+            if (best.length % 2 === 0 && best.slice(0, half) === best.slice(half)) best = best.slice(0, half);
+            text = best;
+          }
+          if (!text) text = titleText;
 
           const external = [...scope.querySelectorAll("a[href*='l.facebook.com/l.php']")].map(a => {
             try { return clean(decodeURIComponent(new URL(a.href).searchParams.get('u') || '')); } catch (e) { return ''; }
@@ -445,13 +492,14 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
           // src الفيديو غالبًا blob: مالوش قيمة برّه الصفحة، فبنعلّم النوع بس
           const videoUrl = videos.map(v => v.currentSrc || v.src).find(u => /^https?:/.test(u || '')) || '';
           const photo = [...scope.querySelectorAll("a[href*='/photo/'], a[href*='/photos/']")].map(a => clean(a.href))[0] || '';
-          const kind = videos.length ? 'video' : external ? 'link' : photo ? 'photo' : (text ? 'text' : '');
+          const shared = sharedLink ? clean(sharedLink) : '';
+          const kind = videos.length ? 'video' : external ? 'link' : shared ? 'share' : photo ? 'photo' : (text ? 'text' : '');
           return {
             text,
             // «post content» في الشيت: الرابط/الميديا لو موجودة، وإلا النص — زي ما كان
-            post_content: videoUrl || external || photo || text,
+            post_content: videoUrl || external || shared || photo || text,
             content_kind: kind,
-            media_url: videoUrl || external || photo,
+            media_url: videoUrl || external || shared || photo,
             story_found: !!story,
             author,
             author_id: userIdFrom(authorLink ? authorLink.href : ''),
@@ -460,7 +508,7 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
             comments
           };
         }""",
-        {"groupId": group_id, "postId": post_id},
+        {"groupId": group_id, "postId": post_id, "noComments": NO_COMMENTS_JS},
     )
 
 
@@ -617,7 +665,7 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     }
 
 
-def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: int, max_comments: int, dry: bool = True, batch_size: int = 80) -> dict:
+def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: int, max_comments: int, dry: bool = True, batch_size: int = 80, progress=None) -> dict:
     group_id = group_key(url)
     post_ids, feed_sort = collect_post_ids(page, group_id, max_posts)
     # اسم الجروب من صفحة الموجز نفسها، قبل ما نفتح أي منشور
@@ -627,6 +675,10 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
     except Exception:
         name = ""
     posts = []
+
+    def result() -> dict:
+        return _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts)
+
     for post_id in post_ids:
         def on_batch(comments, batch_index, done):
             payload = {
@@ -666,7 +718,14 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
                 print(f"sheet batch {index}/{len(chunks)} n={len(chunk)}: {answer[:240]}")
                 post["sheet_batches"] = index
         posts.append(post)
+        # بعد كل منشور: لو اللي بعده وقع، اللي خلص يفضل محفوظ (قبل كده كان بيضيع كله)
+        if progress:
+            progress(result())
         time.sleep(1.5)
+    return result()
+
+
+def _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts) -> dict:
     return {
         "token": TOKEN,
         "group_id": group_id,
@@ -741,6 +800,11 @@ def main() -> None:
             for url in args.group:
                 if recorder:
                     recorder.mark(f"group {url}")
+                def save(payload: dict) -> Path:
+                    out = DUMP_DIR / f"{payload['group_id']}-{stamp}.json"
+                    out.write_text(json.dumps(without_token(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+                    return out
+
                 payload = archive_group(
                     page,
                     url,
@@ -750,11 +814,10 @@ def main() -> None:
                     args.max_comments,
                     dry=args.dry,
                     batch_size=args.batch_size,
+                    progress=save,
                 )
                 results.append(without_token(payload))
-                out = DUMP_DIR / f"{payload['group_id']}-{stamp}.json"
-                out.write_text(json.dumps(without_token(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-                print("saved", out)
+                print("saved", save(payload))
                 if not args.dry and not any(p.get("sheet_batches") for p in payload["posts"]):
                     answer = sheet_post(payload)
                     print("sheet:", answer[:400])

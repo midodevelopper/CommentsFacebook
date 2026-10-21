@@ -121,6 +121,13 @@ PROBES: list[dict] = [
     {"name": "post.photo", "kind": "css", "selector": "a[href*='/photo/'], a[href*='/photos/']",
      "used_by": "visible_snapshot", "expected": "صورة المنشور", "tier": "context", "page": "post",
      "zero_ok": "المنشور مفيهوش صورة"},
+    {"name": "post.shared_link", "kind": "css",
+     "selector": "a[href*='/posts/'], a[href*='permalink.php'], a[href*='story_fbid=']",
+     "used_by": "visible_snapshot", "expected": "رابط المنشور الأصلي لو المنشور متشارك",
+     "tier": "context", "page": "post", "zero_ok": "المنشور مش متشارك"},
+    {"name": "post.shared_text", "kind": "css", "selector": "div[dir='auto'], span[dir='auto']",
+     "used_by": "visible_snapshot", "expected": "نص المنشور المتشارك (مفيهوش data-ad-preview)",
+     "tier": "context", "page": "post", "zero_ok": "مفيش نص"},
     {"name": "comment.media", "kind": "css", "selector": "img[src*='scontent'], a[href*='/photo/'], video",
      "used_by": "visible_snapshot", "expected": "صورة/ستيكر/فيديو في تعليق", "tier": "context", "page": "post",
      "zero_ok": "مفيش ميديا"},
@@ -193,6 +200,29 @@ PROBES: list[dict] = [
 ]
 
 
+# أصفار طبيعية على منشور مفيهوش تعليقات (comments.none_text ظاهر)
+NO_COMMENT_ZEROS = {"comment.article", "comment.permalink", "reply.button", "text.dir_auto"}
+
+# رسايل فيسبوك نفسه اللي بتظهر في كل صفحة ومالهاش علاقة بالسكربت (اتشافت في تشغيل حقيقي 2026-10-21).
+# بتتعدّ في summary.txt بس؛ الملفات الخام بتفضل فيها كل حاجة.
+KNOWN_NOISE = [
+    r"Error with Permissions-Policy header: Unrecognized feature",
+    r"Permissions policy violation: unload is not allowed",
+    r"Minified React error #418",                       # hydration mismatch جوه فيسبوك
+    r"Multiple readback operations using getImageData",
+    r"ERR_(ABORTED|CONNECTION_CLOSED) .*fbcdn\.net",    # ستريم فيديو اتلغى لما الصفحة اتنقلت
+]
+_NOISE_RE = None
+
+
+def is_known_noise(text) -> bool:
+    global _NOISE_RE
+    if _NOISE_RE is None:
+        import re as _re
+        _NOISE_RE = _re.compile("|".join(KNOWN_NOISE))
+    return bool(text) and bool(_NOISE_RE.search(str(text)))
+
+
 def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -253,11 +283,17 @@ def probe_selectors(page, page_kind: str = "auto") -> dict:
     broken = zeros("critical")
     degraded = zeros("degraded")
 
+    # منشور مفيهوش تعليقات: فيسبوك كاتب «لا توجد تعليقات حتى الآن»، فأصفار التعليقات والرد والفرز طبيعية
+    none_text = next((r for r in results if r["name"] == "comments.none_text"), None)
+    no_comments = bool(none_text and none_text["count"] > 0 and page_kind == "post")
+    if no_comments:
+        broken = [n for n in broken if n not in NO_COMMENT_ZEROS]
+
     # قاعدة مشتقّة: الفرز بيبوظ بس لو الاتنين صفر —
     # واحد منهم صفر معناه إننا على حالة أو التانية، وده طبيعي
     state = next((r for r in results if r["name"] == "sort.state_newest"), None)
     opener = next((r for r in results if r["name"] == "sort.opener"), None)
-    sort_broken = bool(state and opener and page_kind == "post"
+    sort_broken = bool(state and opener and page_kind == "post" and not no_comments
                        and state["count"] == 0 and opener["count"] == 0)
     if sort_broken:
         broken.append("sort.* (لا حالة ولا زرار فتح)")
@@ -269,6 +305,7 @@ def probe_selectors(page, page_kind: str = "auto") -> dict:
         "critical_zero": broken,
         "degraded_zero": degraded,
         "sort_broken": sort_broken,
+        "no_comments": no_comments,
         "errors": [r["name"] for r in results if r["count"] < 0],
         # متوافق مع اللي قبله
         "zero_match": broken,
@@ -496,7 +533,8 @@ class PageRecorder:
             detail = (event or {}).get("exceptionDetails") or {}
             self._push(self.errors, {
                 "kind": "exceptionThrown",
-                "message": detail.get("text") or "",
+                # detail.text غالبًا «Uncaught» بس؛ الرسالة الحقيقية في exception.description
+                "message": ((detail.get("exception") or {}).get("description") or detail.get("text") or "")[:2000],
                 "url": detail.get("url") or "",
                 "line": detail.get("lineNumber"),
                 "stack": [
@@ -562,15 +600,23 @@ class PageRecorder:
         for key, label in (("trace", "trace"), ("har", "har")):
             if meta.get(key):
                 lines.append(f"{label}: {meta[key]}")
-        hot = [c for c in self.console if c.get("type") == "error"][-15:]
+        # ضوضاء فيسبوك المعروفة بتتعدّ بس، عشان الخطأ الحقيقي مايتدفنش وسط 99 تحذير
+        noise = sum(1 for c in self.console if is_known_noise(c.get("text"))) + \
+            sum(1 for e in self.errors if is_known_noise(e.get("message"))) + \
+            sum(1 for n in self.network if is_known_noise(f"{n.get('failure') or ''} {n.get('url') or ''}"))
+        if noise:
+            lines += ["", f"known Facebook noise (not listed, still in the .jsonl files): {noise}"]
+        hot = [c for c in self.console if c.get("type") == "error" and not is_known_noise(c.get("text"))][-15:]
         if hot:
             lines += ["", "last console errors:"] + [f"  - {c.get('text','')[:300]}" for c in hot]
-        if self.errors:
-            lines += ["", "page errors:"] + [f"  - {e.get('kind')}: {str(e.get('message'))[:300]}" for e in self.errors[-15:]]
-        if self.network:
+        errors = [e for e in self.errors if not is_known_noise(e.get("message"))]
+        if errors:
+            lines += ["", "page errors:"] + [f"  - {e.get('kind')}: {str(e.get('message'))[:300]}" for e in errors[-15:]]
+        network = [n for n in self.network if not is_known_noise(f"{n.get('failure') or ''} {n.get('url') or ''}")]
+        if network:
             lines += ["", "network problems:"] + [
                 f"  - {n.get('status') or n.get('failure')} {n.get('method','')} {str(n.get('url'))[:160]}"
-                for n in self.network[-20:]
+                for n in network[-20:]
             ]
         return "\n".join(lines) + "\n"
 

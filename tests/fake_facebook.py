@@ -63,6 +63,10 @@ class Post:
     video_src: str | None = None
     escape_closes: bool = False           # live 2026-10-21: Escape closes the post dialog -> facebook.com/
     no_comments_text: bool = True         # Facebook writes «لا توجد تعليقات حتى الآن» when there are none
+    # live 2026-10-21: a shared post has no data-ad-preview; the shared text sits in dir=auto blocks
+    # (rendered twice: visible + "see more" copy) next to a link to the original /<page>/posts/pfbid...
+    shared_text: str | None = None
+    shared_link: str = "https://www.facebook.com/somepage/posts/pfbid0SharedOriginal"
 
 
 @dataclass
@@ -150,9 +154,14 @@ function render() {
   const story = el('div', {role: 'article'},
     el('h2', {}, D.author_id ? el('a', {href: userUrl(D.author_id)}, D.author) : el('a', {href: `${base}/`}, D.author || '')),
     el('a', {href: `${base}/posts/${P}/?${tok}`, 'aria-label': D.created}, '٣ س'),
-    D.message !== null ? el('div', {'data-ad-preview': 'message'}, el('div', {dir: 'auto'}, D.message)) : null,
+    D.message !== null && D.shared_text === null ? el('div', {'data-ad-preview': 'message'}, el('div', {dir: 'auto'}, D.message)) : null,
+    D.shared_text !== null ? el('div', {class: 'shared'},
+      el('a', {href: D.shared_link + '?' + tok}, 'صفحة المصدر'),
+      el('div', {dir: 'auto'}, 'منذ ٢١ دقيقة · تمت المشاركة مع العامة'),
+      el('div', {dir: 'auto'}, el('span', {}, D.shared_text), el('span', {style: 'display:none'}, D.shared_text))) : null,
     D.external_url ? el('a', {href: 'https://l.facebook.com/l.php?u=' + encodeURIComponent(D.external_url) + '&h=AT0'}, 'link') : null,
-    D.video_src ? el('video', {src: D.video_src}) : null);
+    D.video_src ? el('video', {src: D.video_src}) : null,
+    el('div', {role: 'button'}, EN ? 'Like' : 'أعجبني'));          // real posts always have action buttons
   host.append(story);
   if (D.composer === 'top') host.append(composer('post'));
   if (D.sort_mode !== 'none') {

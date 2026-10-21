@@ -397,12 +397,12 @@ def test_post_one_missing_reply_button(page, fake_fb):
 
 
 @pytest.mark.browser
-def test_post_one_editor_never_appears_raises(page, fake_fb):
-    """No composer anywhere: the textbox click times out (5 s) and the exception propagates."""
-    post = setup_post(fake_fb, reply_box=False, composer=None)
-    with pytest.raises(Exception) as exc:
-        replies.post_one(page, item(post.comments[0].id))
-    assert "Timeout" in type(exc.value).__name__ or "Timeout" in str(exc.value)
+@pytest.mark.parametrize("composer", [None, "top", "bottom"])
+def test_post_one_no_reply_box_types_nothing(page, fake_fb, composer):
+    """No reply box opened: return no-reply-box, and never fall back to the public comment box."""
+    post = setup_post(fake_fb, reply_box=False, composer=composer)
+    assert replies.post_one(page, item(post.comments[0].id)) == "no-reply-box"
+    assert sent(page) == []
 
 
 @pytest.mark.browser
@@ -423,13 +423,15 @@ def test_post_one_reports_posted_without_verifying_publication(page, fake_fb):
 
 
 @pytest.mark.browser
-def test_post_one_uses_last_textbox_on_page(page, fake_fb):
-    """Characterization (risk D-12): the reply goes into the LAST role=textbox on the page.
-    If the main comment composer sits below the reply box, the reply is typed there instead."""
-    post = setup_post(fake_fb, composer="bottom")
-    target = post.comments[0].id
-    assert replies.post_one(page, item(target)) == "posted"
-    assert sent(page)[0]["comment_id"] == "post"
+@pytest.mark.parametrize("composer", ["bottom", "top", None])
+def test_post_one_types_into_the_new_reply_box_not_the_public_composer(page, fake_fb, composer):
+    """Fixed D-12, confirmed on the live layout 2026-10-21: «اكتب تعليقًا عامًا» sits at the bottom of the
+    post dialog, so 'last textbox on the page' posted the reply as a new public comment."""
+    post = setup_post(fake_fb, composer=composer)
+    target = post.comments[1].id
+    assert replies.post_one(page, item(target, "شكرا")) == "posted"
+    assert sent(page) == [{"comment_id": target, "text": "شكرا",
+                           "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={target}"}]
 
 
 @pytest.mark.browser

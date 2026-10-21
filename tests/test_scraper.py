@@ -333,34 +333,80 @@ def test_sheet_post_stops_without_explicit_ok_true(sheet, body):
         scraper.sheet_post({})
 
 
-def test_sheet_post_http_error_raises_systemexit_with_code_and_detail(sheet):
+@pytest.fixture
+def no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(scraper.time, "sleep", slept.append)
+    return slept
+
+
+def test_sheet_post_http_5xx_retried_then_systemexit(sheet, no_sleep):
+    """Fixed D-30: one transient Apps Script HTTP 500 used to abort the whole run (seen live)."""
     sheet.respond(status=500, body="x" * 2000)
     with pytest.raises(SystemExit) as exc:
         scraper.sheet_post({})
     msg = str(exc.value)
-    assert "HTTP 500" in msg
-    assert msg.count("x") == 500                              # detail truncated to 500 chars
+    assert "HTTP 500" in msg and "محاولة 3" in msg
+    assert msg.count("x") == 300
+    assert len(sheet.requests) == scraper.SHEET_ATTEMPTS == 3
+    assert no_sleep == [5, 15]
 
 
-def test_sheet_post_network_error_propagates_as_urlerror(monkeypatch):
+def test_sheet_post_5xx_then_success(sheet, no_sleep):
+    sheet.queue(status=500, body="<html>We're sorry, a server error occurred.</html>", content_type="text/html")
+    sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
+    assert scraper.sheet_post({"token": "t"}) == '{"ok":true,"posts_new":1}'
+    assert len(sheet.requests) == 2 and sheet.requests[0]["body"] == sheet.requests[1]["body"]
+    assert no_sleep == [5]
+
+
+def test_sheet_post_4xx_not_retried(sheet, no_sleep):
+    sheet.respond(status=403, body="forbidden")
+    with pytest.raises(SystemExit) as exc:
+        scraper.sheet_post({})
+    assert "HTTP 403" in str(exc.value) and len(sheet.requests) == 1 and no_sleep == []
+
+
+def test_sheet_post_bad_token_not_retried(sheet, no_sleep):
+    sheet.respond(body='{"ok":false,"error":"bad token"}')
+    with pytest.raises(SystemExit):
+        scraper.sheet_post({})
+    assert len(sheet.requests) == 1 and no_sleep == []
+
+
+def test_sheet_post_busy_lock_retried(sheet, no_sleep):
+    sheet.queue(body='{"ok":false,"error":"Exception: Lock timeout: another process was holding the lock"}')
+    sheet.queue(body='{"ok":true}')
+    assert scraper.sheet_post({}) == '{"ok":true}'
+    assert no_sleep == [5]
+
+
+def test_apps_script_error_extracts_readable_text():
+    page = ("<!DOCTYPE html><html><head><script nonce='x'>window['ppConfig'] = {a: 1};</script>"
+            "<style>.x{}</style></head><body><div>Exception: Service Spreadsheets timed out &amp; more</div></body></html>")
+    assert scraper.apps_script_error(page) == "Exception: Service Spreadsheets timed out & more"
+
+
+def test_sheet_post_network_error_retried_then_propagates(monkeypatch, no_sleep):
     from conftest import free_port
 
     monkeypatch.setattr(scraper, "WEBAPP", f"http://127.0.0.1:{free_port()}/exec")
     with pytest.raises(urllib.error.URLError):
         scraper.sheet_post({})
+    assert no_sleep == [5, 15]
 
 
-def test_sheet_post_timeout_is_90_seconds_and_timeout_propagates(monkeypatch):
-    seen = {}
+def test_sheet_post_timeout_is_90_seconds_and_retried(monkeypatch, no_sleep):
+    seen = []
 
     def fake_urlopen(req, timeout):
-        seen["timeout"] = timeout
+        seen.append(timeout)
         raise TimeoutError("timed out")
 
     monkeypatch.setattr(scraper.urllib.request, "urlopen", fake_urlopen)
     with pytest.raises(TimeoutError):
         scraper.sheet_post({})
-    assert seen["timeout"] == 90
+    assert seen == [90, 90, 90]
 
 
 # ---------------------------------------------------------------- parse_args
@@ -610,7 +656,7 @@ def run_main(monkeypatch, *argv):
 
 
 def fake_archive(posts_by_group):
-    def archive(page, url, min_posts, max_posts, min_c, max_c, dry=True, batch_size=80):
+    def archive(page, url, min_posts, max_posts, min_c, max_c, dry=True, batch_size=80, progress=None):
         gid = scraper.group_key(url)
         return {"token": scraper.TOKEN, "group_id": gid, "posts": posts_by_group.get(gid, [])}
     return archive
@@ -807,3 +853,26 @@ def test_own_group_post_id_accepts_any_group_when_given_a_slug():
 
 def test_without_token():
     assert scraper.without_token({"token": "s", "a": 1}) == {"a": 1}
+
+
+
+def test_archive_group_reports_progress_after_every_post(flow):
+    calls, data = flow
+    data.update({"11": 1, "12": 0, "13": 2})
+    seen = []
+    scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10,
+                          progress=lambda r: seen.append([p["post_id"] for p in r["posts"]]))
+    assert seen == [["11"], ["11", "12"], ["11", "12", "13"]]
+
+
+def test_main_keeps_finished_posts_when_a_later_post_fails(monkeypatch, main_env):
+    """Fixed D-31 (seen live): a failure mid-group used to lose every post already scraped."""
+    def archive(page, url, *a, progress=None, **k):
+        gid = scraper.group_key(url)
+        progress({"token": scraper.TOKEN, "group_id": gid, "posts": [{"post_id": "9"}]})
+        raise SystemExit("الشيت رفض الإرسال HTTP 500")
+    monkeypatch.setattr(scraper, "archive_group", archive)
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, *BASE)
+    saved = json.loads((main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8"))
+    assert saved == {"group_id": "1", "posts": [{"post_id": "9"}]}

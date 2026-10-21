@@ -57,6 +57,10 @@ def post_one(page, item: dict) -> str:
           const button = [...article.querySelectorAll('[role="button"]')]
             .find(el => (el.innerText || '').trim() === 'رد' || (el.innerText || '').trim() === 'Reply');
           if (!button) return 'no-reply-button';
+          // نعلّم الصناديق الموجودة قبل الضغط: صندوق الرد هو اللي هيظهر بعده
+          document.querySelectorAll('[data-hermes-article]').forEach(e => e.removeAttribute('data-hermes-article'));
+          document.querySelectorAll('[role="textbox"]').forEach(b => b.setAttribute('data-hermes-before', '1'));
+          article.setAttribute('data-hermes-article', '1');
           button.click();
           return 'opened';
         }""",
@@ -64,8 +68,23 @@ def post_one(page, item: dict) -> str:
     )
     if clicked != "opened":
         return clicked
+    # مش «آخر textbox في الصفحة»: صندوق «اكتب تعليقًا عامًا» تحت خالص، وكان الرد بيتكتب فيه
+    # كتعليق عام جديد. بناخد أول صندوق جديد ظهر بعد article التعليق.
+    find_box = """() => {
+      const article = document.querySelector('[data-hermes-article]');
+      if (!article) return false;
+      const fresh = [...document.querySelectorAll('[role="textbox"]:not([data-hermes-before])')]
+        .filter(b => article.contains(b) || (article.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING));
+      if (!fresh.length) return false;
+      fresh[0].setAttribute('data-hermes-target', '1');
+      return true;
+    }"""
     page.wait_for_timeout(800)
-    box = page.locator("[role='textbox']").last
+    if not page.evaluate(find_box):
+        page.wait_for_timeout(1500)
+        if not page.evaluate(find_box):
+            return "no-reply-box"
+    box = page.locator("[data-hermes-target]").first
     box.click(timeout=5000)
     box.fill(item["reply"])
     page.keyboard.press("Enter")
@@ -124,7 +143,7 @@ def main() -> None:
                         print(f"تحذير: {item['comment_id']} اتنشر بس ماتعلّمش posted في الشيت: {answer}",
                               file=sys.stderr)
                 elif recorder:
-                    # مانجحش من غير استثناء: no-comment / no-reply-button / missing-permalink
+                    # مانجحش من غير استثناء: no-comment / no-reply-button / no-reply-box / missing-permalink
                     recorder.dump(f"{status}-{item['comment_id']}")
             if recorder and args.trace:
                 recorder.dump("complete")
