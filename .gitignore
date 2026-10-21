@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------
+# بروفايل المتصفح الثابت: فيه كوكيز وجلسات فيسبوك. ممنوع يترفع.
+# Fixed browser profile: contains Facebook cookies / live sessions.
+# NEVER commit this.
+# ---------------------------------------------------------------
+profile/
+
+# مخرجات السحب: فيها أسماء ومعرفات ونصوص مستخدمين حقيقيين
+# Scrape output: real users' names, IDs and comment text
+dumps/
+
+# البيئة الافتراضية
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# أسرار محلية
+.env
+.env.*
+!.env.example
+
+# محررات / نظام
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
