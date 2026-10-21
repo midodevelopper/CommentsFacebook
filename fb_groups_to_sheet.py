@@ -509,6 +509,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdp", default=CDP)
     parser.add_argument("--dry", action="store_true", help="احفظ JSON بس، من غير إرسال للشيت")
     parser.add_argument("--batch-size", type=int, default=80, help="حجم دفعة الإرسال للشيت لما التعليقات تبقى بالآلاف")
+    parser.add_argument("--debug", action="store_true",
+                        help="سجّل الكونسول والأخطاء والشبكة، واحفظ HTML وصورة في debug/ لو حصل خطأ")
     args = parser.parse_args()
     if args.min_posts < 1 or args.max_posts < args.min_posts:
         raise SystemExit("min-posts لازم يكون 1 أو أكتر، وmax-posts أكبر منه أو يساويه")
@@ -528,8 +530,15 @@ def main() -> None:
         browser = playwright.chromium.connect_over_cdp(args.cdp)
         context = browser.contexts[0]
         page = context.new_page()
+        recorder = None
+        if args.debug:
+            from browser_debug import PageRecorder
+
+            recorder = PageRecorder(page, label="scrape")
         try:
             for url in args.group:
+                if recorder:
+                    recorder.mark(f"group {url}")
                 payload = archive_group(
                     page,
                     url,
@@ -547,7 +556,14 @@ def main() -> None:
                 if not args.dry and not any(p.get("sheet_batches") for p in payload["posts"]):
                     answer = sheet_post(payload)
                     print("sheet:", answer[:400])
+        except BaseException as exc:
+            # SystemExit كمان: فشل فرز التعليقات بيرفعه، وده بالظبط اللي عايزين نشوف صفحته
+            if recorder:
+                recorder.dump("failed", exc=exc)
+            raise
         finally:
+            if recorder:
+                recorder.detach()
             page.close()
     summary = DUMP_DIR / f"run-{stamp}.json"
     summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

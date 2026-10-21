@@ -1,0 +1,554 @@
+r"""
+أدوات تشخيص المتصفح: تلتقط كل حاجة محتاجها لتصليح أي خطأ أثناء التشغيل.
+
+بتجمع لكل لقطة:
+  page.html          شكل الصفحة الكامل وقت الخطأ
+  page.png           صورة الصفحة (full page، وبترجع للـ viewport لو فشلت)
+  console.jsonl      كل رسائل الكونسول (log/info/warn/error) بمكانها في الكود
+  errors.jsonl       الاستثناءات غير الملتقطة في الصفحة (pageerror / exceptionThrown)
+  network.jsonl      الطلبات الفاشلة والردود 4xx/5xx
+  browser-log.jsonl  سجل المتصفح من CDP (Log.entryAdded): شبكة، أمان، CORS، CSP
+  meta.json          الرابط، العنوان، الـ viewport، الكوكيز، الوقت، ملخص العدّادات
+  storage.json       localStorage و sessionStorage
+
+---
+
+استعمال كمكتبة (الحالة الأهم: دَمب تلقائي عند أي خطأ):
+
+    from browser_debug import PageRecorder
+
+    rec = PageRecorder(page, label="scrape")
+    try:
+        ...                      # الكود بتاعك
+    except Exception:
+        rec.dump("failed")       # يحفظ كل حاجة
+        raise
+    finally:
+        rec.detach()
+
+أو أقصر، بيعمل دَمب لوحده لو حصل استثناء:
+
+    from browser_debug import recording
+
+    with recording(page, "post-12345") as rec:
+        page.goto(url)
+        rec.mark("after-goto")   # لقطة وسط الشغل، اختيارية
+
+---
+
+استعمال من سطر الأوامر (المتصفح لازم يكون شغال على CDP):
+
+    .venv\Scripts\python.exe browser_debug.py snapshot
+        يصوّر كل التابّات المفتوحة حالًا
+
+    .venv\Scripts\python.exe browser_debug.py snapshot --url https://www.facebook.com/groups/123
+        يفتح تاب، يسجّل التحميل من أوله، يصوّر، ويقفل
+
+    .venv\Scripts\python.exe browser_debug.py watch
+        يفضل يطبع الكونسول والأخطاء والطلبات الفاشلة وإنت بتتصرف في المتصفح بإيدك،
+        وعند Ctrl+C يحفظ كل اللقطات
+
+المخرجات في:  D:\Hermes Browser\debug\<الوقت>-<الاسم>\
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+DEBUG_DIR = Path(os.environ.get("FB_DEBUG_DIR", ROOT / "debug"))
+CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
+
+# الكونسول بيطلع رسائل بالآلاف على فيسبوك. نحد الحجم بدل ما الذاكرة تتفجّر.
+MAX_EVENTS = int(os.environ.get("FB_DEBUG_MAX_EVENTS", "5000"))
+
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def _safe(name: str) -> str:
+    keep = "-_."
+    cleaned = "".join(c if (c.isalnum() or c in keep) else "-" for c in name)
+    return cleaned.strip("-") or "snap"
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+class PageRecorder:
+    """يتنصّت على صفحة ويجمع كل الإشارات اللي بتفيد في تشخيص خطأ."""
+
+    def __init__(self, page, label: str = "page", attach: bool = True, use_cdp: bool = True):
+        self.page = page
+        self.label = label
+        self.console: list[dict] = []
+        self.errors: list[dict] = []
+        self.network: list[dict] = []
+        self.browser_log: list[dict] = []
+        self.lifecycle: list[dict] = []
+        self.dumps: list[Path] = []
+        self._cdp = None
+        self._attached = False
+        self._t0 = time.time()
+        if attach:
+            self.attach(use_cdp=use_cdp)
+
+    # ---------- التنصّت ----------
+
+    def _at(self) -> float:
+        return round(time.time() - self._t0, 3)
+
+    def _push(self, bucket: list[dict], row: dict) -> None:
+        if len(bucket) >= MAX_EVENTS:
+            bucket.pop(0)
+        row["at"] = self._at()
+        bucket.append(row)
+
+    def attach(self, use_cdp: bool = True) -> "PageRecorder":
+        if self._attached:
+            return self
+        page = self.page
+
+        def on_console(msg) -> None:
+            text = ""
+            try:
+                text = msg.text
+            except Exception:
+                text = "<unreadable>"
+            row: dict[str, Any] = {"type": msg.type, "text": text}
+            try:
+                loc = msg.location or {}
+                if loc.get("url"):
+                    row["source"] = f"{loc.get('url')}:{loc.get('lineNumber')}:{loc.get('columnNumber')}"
+            except Exception:
+                pass
+            self._push(self.console, row)
+
+        def on_pageerror(err) -> None:
+            self._push(self.errors, {"kind": "pageerror", "message": str(err)})
+
+        def on_requestfailed(req) -> None:
+            failure = ""
+            try:
+                failure = req.failure or ""
+            except Exception:
+                pass
+            # طلبات ملغية عادية (navigation/abort) مش بالضرورة أخطاء، بنسجّلها وخلاص
+            self._push(self.network, {
+                "kind": "requestfailed",
+                "method": req.method,
+                "url": req.url,
+                "resource_type": req.resource_type,
+                "failure": failure,
+            })
+
+        def on_response(resp) -> None:
+            try:
+                status = resp.status
+            except Exception:
+                return
+            if status < 400:
+                return
+            self._push(self.network, {
+                "kind": "response",
+                "status": status,
+                "method": resp.request.method,
+                "url": resp.url,
+                "resource_type": resp.request.resource_type,
+            })
+
+        def on_crash(_page) -> None:
+            self._push(self.errors, {"kind": "crash", "message": "page crashed"})
+
+        def on_dialog(dialog) -> None:
+            self._push(self.errors, {"kind": "dialog", "message": dialog.message, "dialog_type": dialog.type})
+            with contextlib.suppress(Exception):
+                dialog.dismiss()
+
+        def on_framenavigated(frame) -> None:
+            with contextlib.suppress(Exception):
+                if frame == self.page.main_frame:
+                    self._push(self.lifecycle, {"kind": "navigated", "url": frame.url})
+
+        self._handlers = [
+            ("console", on_console),
+            ("pageerror", on_pageerror),
+            ("requestfailed", on_requestfailed),
+            ("response", on_response),
+            ("crash", on_crash),
+            ("dialog", on_dialog),
+            ("framenavigated", on_framenavigated),
+        ]
+        for event, handler in self._handlers:
+            with contextlib.suppress(Exception):
+                page.on(event, handler)
+
+        if use_cdp:
+            self._attach_cdp()
+        self._attached = True
+        return self
+
+    def _attach_cdp(self) -> None:
+        """سجل المتصفح نفسه: أخطاء CORS و CSP و mixed content اللي الكونسول العادي بيفوّتها."""
+        try:
+            self._cdp = self.page.context.new_cdp_session(self.page)
+            self._cdp.send("Log.enable")
+            self._cdp.send("Runtime.enable")
+        except Exception as exc:
+            self._push(self.lifecycle, {"kind": "cdp-unavailable", "message": str(exc)})
+            self._cdp = None
+            return
+
+        def on_entry(event) -> None:
+            entry = (event or {}).get("entry") or {}
+            self._push(self.browser_log, {
+                "source": entry.get("source"),
+                "level": entry.get("level"),
+                "text": entry.get("text"),
+                "url": entry.get("url"),
+                "line": entry.get("lineNumber"),
+            })
+
+        def on_exception(event) -> None:
+            detail = (event or {}).get("exceptionDetails") or {}
+            self._push(self.errors, {
+                "kind": "exceptionThrown",
+                "message": detail.get("text") or "",
+                "url": detail.get("url") or "",
+                "line": detail.get("lineNumber"),
+                "stack": [
+                    f"{f.get('functionName') or '<anon>'} @ {f.get('url')}:{f.get('lineNumber')}"
+                    for f in ((detail.get("stackTrace") or {}).get("callFrames") or [])[:15]
+                ],
+            })
+
+        with contextlib.suppress(Exception):
+            self._cdp.on("Log.entryAdded", on_entry)
+        with contextlib.suppress(Exception):
+            self._cdp.on("Runtime.exceptionThrown", on_exception)
+
+    def detach(self) -> None:
+        for event, handler in getattr(self, "_handlers", []):
+            with contextlib.suppress(Exception):
+                self.page.remove_listener(event, handler)
+        if self._cdp is not None:
+            with contextlib.suppress(Exception):
+                self._cdp.detach()
+            self._cdp = None
+        self._attached = False
+
+    # ---------- اللقطات ----------
+
+    def mark(self, note: str) -> None:
+        """علامة في الخط الزمني من غير حفظ ملفات."""
+        self._push(self.lifecycle, {"kind": "mark", "note": note})
+
+    def counts(self) -> dict:
+        return {
+            "console": len(self.console),
+            "console_errors": sum(1 for c in self.console if c.get("type") == "error"),
+            "console_warnings": sum(1 for c in self.console if c.get("type") == "warning"),
+            "page_errors": len(self.errors),
+            "network_problems": len(self.network),
+            "browser_log": len(self.browser_log),
+        }
+
+    def dump(self, reason: str = "dump", exc: BaseException | None = None) -> Path:
+        """يحفظ كل حاجة في فولدر واحد ويرجّع مساره. مابيرفعش استثناء أبدًا."""
+        out = DEBUG_DIR / f"{_stamp()}-{_safe(self.label)}-{_safe(reason)}"
+        out.mkdir(parents=True, exist_ok=True)
+
+        meta: dict[str, Any] = {
+            "label": self.label,
+            "reason": reason,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_sec": self._at(),
+            "counts": self.counts(),
+        }
+
+        # الرابط والعنوان أول حاجة: لو الصفحة ميتة، ده اللي بيفرق
+        for key, getter in (("url", lambda: self.page.url), ("title", lambda: self.page.title())):
+            try:
+                meta[key] = getter()
+            except Exception as e:
+                meta[key] = f"<unavailable: {e}>"
+
+        if exc is not None:
+            meta["exception"] = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-8000:],
+            }
+
+        try:
+            meta["viewport"] = self.page.viewport_size
+        except Exception:
+            pass
+
+        # HTML
+        try:
+            (out / "page.html").write_text(self.page.content(), encoding="utf-8", errors="replace")
+        except Exception as e:
+            meta["html_error"] = str(e)
+            # الصفحة ممكن تكون في نص تنقّل. نجرب الـ DOM الخام من الـ frame
+            try:
+                html = self.page.evaluate("() => document.documentElement.outerHTML")
+                (out / "page.html").write_text(html, encoding="utf-8", errors="replace")
+                meta["html_error"] += " | recovered via evaluate"
+            except Exception as e2:
+                meta["html_error"] += f" | evaluate failed: {e2}"
+
+        # الصورة: full page الأول، وبعدين viewport
+        shot = out / "page.png"
+        try:
+            self.page.screenshot(path=str(shot), full_page=True, timeout=20000)
+            meta["screenshot"] = "full_page"
+        except Exception as e:
+            try:
+                self.page.screenshot(path=str(shot), timeout=10000)
+                meta["screenshot"] = f"viewport only ({e})"
+            except Exception as e2:
+                meta["screenshot"] = f"failed: {e2}"
+
+        # النصوص الظاهرة: أسرع في القراءة من HTML خام
+        try:
+            text = self.page.evaluate("() => document.body ? document.body.innerText : ''")
+            (out / "page.txt").write_text(text or "", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        # التخزين والكوكيز
+        try:
+            storage = self.page.evaluate(
+                """() => {
+                  const grab = (s) => { const o = {}; try { for (let i = 0; i < s.length; i++) { const k = s.key(i); o[k] = s.getItem(k); } } catch (e) { o._error = String(e); } return o; };
+                  return {local: grab(localStorage), session: grab(sessionStorage)};
+                }"""
+            )
+            (out / "storage.json").write_text(json.dumps(storage, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            cookies = self.page.context.cookies()
+            meta["cookie_count"] = len(cookies)
+            # أسماء ونطاقات بس. القيم أسرار جلسة، مش بتتحفظ.
+            meta["cookie_names"] = sorted({f"{c.get('domain')}{c.get('name')}" for c in cookies})[:80]
+        except Exception:
+            pass
+
+        _write_jsonl(out / "console.jsonl", self.console)
+        _write_jsonl(out / "errors.jsonl", self.errors)
+        _write_jsonl(out / "network.jsonl", self.network)
+        _write_jsonl(out / "browser-log.jsonl", self.browser_log)
+        _write_jsonl(out / "lifecycle.jsonl", self.lifecycle)
+        (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # ملخص بشري يتقرأ بسرعة
+        lines = [
+            f"# {self.label} / {reason}",
+            f"url:   {meta.get('url')}",
+            f"title: {meta.get('title')}",
+            f"saved: {meta.get('saved_at')}  (+{meta.get('elapsed_sec')}s)",
+            "",
+            "counts: " + json.dumps(meta["counts"], ensure_ascii=False),
+        ]
+        if exc is not None:
+            lines += ["", f"exception: {meta['exception']['type']}: {meta['exception']['message']}"]
+        hot = [c for c in self.console if c.get("type") == "error"][-15:]
+        if hot:
+            lines += ["", "last console errors:"] + [f"  - {c.get('text','')[:300]}" for c in hot]
+        if self.errors:
+            lines += ["", "page errors:"] + [f"  - {e.get('kind')}: {str(e.get('message'))[:300]}" for e in self.errors[-15:]]
+        if self.network:
+            lines += ["", "network problems:"] + [
+                f"  - {n.get('status') or n.get('failure')} {n.get('method','')} {str(n.get('url'))[:160]}"
+                for n in self.network[-20:]
+            ]
+        (out / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self.dumps.append(out)
+        print(f"[debug] saved {out}", file=sys.stderr)
+        return out
+
+
+@contextlib.contextmanager
+def recording(page, label: str = "page", dump_always: bool = False):
+    """يسجّل، ويعمل دَمب تلقائي لو حصل استثناء (أو دايمًا لو dump_always)."""
+    rec = PageRecorder(page, label=label)
+    try:
+        yield rec
+    except BaseException as exc:
+        rec.dump("exception", exc=exc)
+        raise
+    else:
+        if dump_always:
+            rec.dump("ok")
+    finally:
+        rec.detach()
+
+
+# ------------------------- سطر الأوامر -------------------------
+
+
+def _connect(cdp: str):
+    from playwright.sync_api import sync_playwright
+
+    playwright = sync_playwright().start()
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp)
+    except Exception as exc:
+        playwright.stop()
+        raise SystemExit(
+            f"مش قادر أتوصل بـ CDP على {cdp}: {exc}\n"
+            f"افتح المتصفح الأول:  .venv\\Scripts\\python.exe launch_browser.py"
+        ) from exc
+    return playwright, browser
+
+
+def cmd_snapshot(args) -> int:
+    playwright, browser = _connect(args.cdp)
+    try:
+        context = browser.contexts[0]
+        if args.url:
+            page = context.new_page()
+            rec = PageRecorder(page, label="snapshot")
+            try:
+                page.goto(args.url, wait_until=args.wait_until, timeout=args.timeout)
+            except Exception as exc:
+                print(f"التحميل فشل: {exc}", file=sys.stderr)
+                rec.dump("goto-failed", exc=exc)
+                return 1
+            page.wait_for_timeout(args.settle)
+            rec.dump("snapshot")
+            rec.detach()
+            if not args.keep:
+                page.close()
+            return 0
+
+        pages = [p for p in context.pages if not p.is_closed()]
+        if not pages:
+            print("مفيش تابّات مفتوحة", file=sys.stderr)
+            return 1
+        for index, page in enumerate(pages, 1):
+            url = ""
+            with contextlib.suppress(Exception):
+                url = page.url
+            print(f"[{index}/{len(pages)}] {url}")
+            rec = PageRecorder(page, label=f"tab{index}")
+            # اللي فات مش مسجّل، فنستنى شوية نلقط أي كونسول جديد
+            page.wait_for_timeout(args.settle)
+            rec.dump("snapshot")
+            rec.detach()
+        return 0
+    finally:
+        with contextlib.suppress(Exception):
+            browser.close()
+        playwright.stop()
+
+
+def cmd_watch(args) -> int:
+    playwright, browser = _connect(args.cdp)
+    recorders: list[PageRecorder] = []
+    try:
+        context = browser.contexts[0]
+
+        def live(rec: PageRecorder, tag: str) -> None:
+            page = rec.page
+
+            def show_console(msg) -> None:
+                if msg.type in ("error", "warning") or args.all:
+                    print(f"  [{tag}] console.{msg.type}: {msg.text[:400]}")
+
+            def show_error(err) -> None:
+                print(f"  [{tag}] PAGE ERROR: {str(err)[:400]}")
+
+            def show_failed(req) -> None:
+                with contextlib.suppress(Exception):
+                    print(f"  [{tag}] FAILED {req.method} {req.url[:140]} -> {req.failure}")
+
+            with contextlib.suppress(Exception):
+                page.on("console", show_console)
+                page.on("pageerror", show_error)
+                page.on("requestfailed", show_failed)
+
+        for index, page in enumerate([p for p in context.pages if not p.is_closed()], 1):
+            rec = PageRecorder(page, label=f"watch{index}")
+            live(rec, f"tab{index}")
+            recorders.append(rec)
+
+        def on_new_page(page) -> None:
+            tag = f"tab{len(recorders) + 1}"
+            print(f"تاب جديد: {tag}")
+            rec = PageRecorder(page, label=f"watch{len(recorders) + 1}")
+            live(rec, tag)
+            recorders.append(rec)
+
+        with contextlib.suppress(Exception):
+            context.on("page", on_new_page)
+
+        print(f"بيراقب {len(recorders)} تاب. اتصرف في المتصفح عادي. Ctrl+C يحفظ كل حاجة.")
+        if not recorders:
+            print("تحذير: مفيش تابّات. افتح تاب في المتصفح وهيتسجّل تلقائي.", file=sys.stderr)
+        deadline = time.time() + args.seconds if args.seconds else None
+        try:
+            while True:
+                if deadline and time.time() >= deadline:
+                    print("الوقت خلص.")
+                    break
+                if recorders:
+                    recorders[0].page.wait_for_timeout(500)
+                else:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nجاري الحفظ...")
+        for rec in recorders:
+            with contextlib.suppress(Exception):
+                rec.dump("watch")
+            rec.detach()
+        return 0
+    finally:
+        with contextlib.suppress(Exception):
+            browser.close()
+        playwright.stop()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="تشخيص المتصفح: HTML وكونسول وأخطاء وشبكة وصور",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--cdp", default=CDP, help=f"عنوان CDP (افتراضي {CDP})")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    snap = sub.add_parser("snapshot", help="يصوّر التابّات المفتوحة، أو يفتح رابط ويصوّره")
+    snap.add_argument("--url", help="لو موجود: يفتح تاب جديد على الرابط ده ويسجّل من أول التحميل")
+    snap.add_argument("--wait-until", default="domcontentloaded",
+                      choices=["load", "domcontentloaded", "networkidle", "commit"])
+    snap.add_argument("--timeout", type=int, default=60000)
+    snap.add_argument("--settle", type=int, default=2500, help="انتظار قبل اللقطة بالمللي ثانية")
+    snap.add_argument("--keep", action="store_true", help="ماتقفلش التاب بعد اللقطة")
+    snap.set_defaults(func=cmd_snapshot)
+
+    watch = sub.add_parser("watch", help="يراقب ويطبع لايف، وعند Ctrl+C يحفظ")
+    watch.add_argument("--seconds", type=int, default=0, help="يوقف لوحده بعد كده (0 = لحد Ctrl+C)")
+    watch.add_argument("--all", action="store_true", help="اطبع كل الكونسول، مش الأخطاء بس")
+    watch.set_defaults(func=cmd_watch)
+
+    args = parser.parse_args()
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

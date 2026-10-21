@@ -110,6 +110,56 @@ $env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
 
 ---
 
+## التشخيص لما حاجة تبوظ
+
+فيسبوك بيغيّر الـ DOM من غير سابق إنذار، فأغلب الأعطال سببها selector بار.
+`browser_debug.py` بيجمع كل حاجة محتاجها في خطوة واحدة.
+
+دَمب تلقائي عند أي فشل أثناء الشغل:
+
+```powershell
+.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL ... --debug
+.venv\Scripts\python.exe fb_return_replies.py --debug
+```
+
+لقطة يدوية، أو مراقبة لايف:
+
+```powershell
+.venv\Scripts\python.exe browser_debug.py snapshot
+.venv\Scripts\python.exe browser_debug.py snapshot --url "https://www.facebook.com/groups/123"
+.venv\Scripts\python.exe browser_debug.py watch
+```
+
+كل لقطة بتروح في `debug/<الوقت>-<اسم>-<سبب>/` وفيها:
+
+| الملف | فيه إيه |
+| --- | --- |
+| `summary.txt` | ابدأ منه: الرابط، العدّادات، آخر الأخطاء |
+| `page.html` | شكل الصفحة الكامل وقت الفشل — ده اللي يوريك الـ selector البار |
+| `page.png` | صورة الصفحة كلها |
+| `page.txt` | النص الظاهر، أسرع في القراءة |
+| `console.jsonl` | كل رسائل الكونسول بمكانها في الكود |
+| `errors.jsonl` | الاستثناءات غير الملتقطة بـ stack trace |
+| `network.jsonl` | الطلبات الفاشلة والردود 4xx/5xx |
+| `browser-log.jsonl` | سجل المتصفح من CDP: CORS، CSP، أمان |
+| `storage.json` | localStorage و sessionStorage |
+| `meta.json` | الرابط، العنوان، الـ viewport، عدد الكوكيز، الاستثناء |
+
+الكوكيز بتتسجّل **بأسمائها ونطاقاتها بس، من غير قيم** — القيم بتساوي الجلسة نفسها.
+و `debug/` مستبعد من git لأن فيه HTML وصور لصفحات مسجّل فيها دخول.
+
+في الكود:
+
+```python
+from browser_debug import PageRecorder, recording
+
+with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل استثناء
+    page.goto(url)
+    rec.mark("after-goto")
+```
+
+---
+
 ## الملفات
 
 | الملف | الوظيفة |
@@ -118,9 +168,12 @@ $env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
 | `start-cdp-browser.cmd` | اختصار للتشغيل |
 | `fb_groups_to_sheet.py` | السحب: جروب > منشورات > تعليقات > الشيت |
 | `fb_return_replies.py` | الرد: الشيت > تعليقات فيسبوك |
+| `browser_debug.py` | التشخيص: HTML، كونسول، أخطاء، شبكة، صور |
 | `facebook_sheet_receiver.gs` | Apps Script اللي بيستقبل ويعمل upsert بدون تكرار |
 | `cdp-ready.html` | صفحة البداية في النافذة المتحكَّم فيها |
+| `CLAUDE.md` | دليل المشروع وسجل التحديثات |
 | `dumps/` | مخرجات JSON محلية (مستبعدة من الريبو) |
+| `debug/` | لقطات التشخيص (مستبعدة من الريبو) |
 | `profile/` | بروفايل كروميوم الثابت (مستبعد من الريبو) |
 
 ## ملاحظة

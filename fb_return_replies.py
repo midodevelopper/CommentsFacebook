@@ -1,5 +1,12 @@
-r"""يرجع ردود عمود reply من الشيت إلى تعليقات فيسبوك. قراءة الشيت ثم كتابة الرد فقط."""
+r"""يرجع ردود عمود reply من الشيت إلى تعليقات فيسبوك. قراءة الشيت ثم كتابة الرد فقط.
+
+التشغيل:
+  .venv\Scripts\python.exe fb_return_replies.py
+  .venv\Scripts\python.exe fb_return_replies.py --debug   # يحفظ HTML/صورة/كونسول لأي رد فشل
+"""
+import argparse
 import json
+import os
 import urllib.parse
 import urllib.request
 
@@ -10,7 +17,7 @@ WEBAPP = (
     "AKfycbzNQ4J6Sewu04sJaWcAJTHeQuCuQzc4At-gNl7oqXKRVTFtedHxaerG7s2-JZFGxfkUmg/exec"
 )
 TOKEN = "CommentSecrets"
-CDP = "http://127.0.0.1:9333"
+CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
 
 
 def sheet_get(action: str) -> dict:
@@ -63,6 +70,12 @@ def post_one(page, item: dict) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="إرجاع الردود من الشيت إلى تعليقات فيسبوك")
+    parser.add_argument("--cdp", default=CDP)
+    parser.add_argument("--debug", action="store_true",
+                        help="احفظ HTML وصورة وكونسول في debug/ لأي رد مانجحش")
+    args = parser.parse_args()
+
     data = sheet_get("pending_replies")
     if not data.get("ok"):
         raise SystemExit(data)
@@ -73,15 +86,33 @@ def main() -> None:
     if not replies:
         return
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(CDP)
+        browser = p.chromium.connect_over_cdp(args.cdp)
         page = browser.contexts[0].new_page()
+        recorder = None
+        if args.debug:
+            from browser_debug import PageRecorder
+
+            recorder = PageRecorder(page, label="replies")
         try:
             for item in replies:
-                status = post_one(page, item)
+                if recorder:
+                    recorder.mark(f"comment {item['comment_id']}")
+                try:
+                    status = post_one(page, item)
+                except Exception as exc:
+                    print(item["comment_id"], "error", exc)
+                    if recorder:
+                        recorder.dump(f"error-{item['comment_id']}", exc=exc)
+                    continue
                 print(item["comment_id"], status)
                 if status == "posted":
                     print(sheet_post({"token": TOKEN, "action": "mark_replied", "comment_ids": [item["comment_id"]]}))
+                elif recorder:
+                    # مانجحش من غير استثناء: no-comment / no-reply-button / missing-permalink
+                    recorder.dump(f"{status}-{item['comment_id']}")
         finally:
+            if recorder:
+                recorder.detach()
             page.close()
 
 

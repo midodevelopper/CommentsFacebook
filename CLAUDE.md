@@ -1,0 +1,148 @@
+# CommentsFacebook — دليل المشروع
+
+أرشفة منشورات وتعليقات جروبات فيسبوك إلى Google Sheet، والرد عليها من الشيت،
+عن طريق كروميوم حقيقي متحكَّم فيه بـ CDP على بروفايل ثابت.
+
+ريبو: https://github.com/midodevelopper/CommentsFacebook (عام / public)
+
+---
+
+## ⚠️ قاعدة إلزامية: كل تحديث يتسجّل هنا
+
+**أي تعديل في المشروع لازم يتضاف في قسم [سجل التحديثات](#سجل-التحديثات) في آخر الملف ده،
+في نفس الـ commit بتاع التعديل.** ده ذاكرة المشروع — مش ملف اختياري.
+
+لكل مدخل: التاريخ، وإيه اللي اتغير، و**ليه**. السبب أهم من الوصف؛
+الكود بيوصف نفسه، إنما النية لأ.
+
+ترتيب الإدخال: الأحدث فوق.
+
+---
+
+## حدود ثابتة ماتتغيرش
+
+1. **بروفايل واحد بس:** `D:\Hermes Browser\profile`
+   المتصفح مايفتحش على بروفايل تاني أبدًا. سبب وجوده إن جلسة فيسبوك تتسجّل
+   مرة واحدة وتفضل محفوظة. أي حاجة بتفتح بروفايل مؤقت = تسجيل الدخول بيضيع.
+
+2. **`profile/` و `dumps/` و `debug/` مستبعدين من git.**
+   `profile/` فيه كوكيز جلسة حقيقية (~198MB). `dumps/` و `debug/` فيهم بيانات
+   مستخدمين حقيقيين وصور صفحات مسجّل فيها دخول. الريبو **عام**، فالاستبعاد ده أمان مش ترتيب.
+
+3. **السحب قراءة فقط.** `fb_groups_to_sheet.py` مابيردّش ومابيعملش لايك ومابيكتبش حاجة.
+   الكتابة في `fb_return_replies.py` بس.
+
+4. **الفرز مش اختياري.** المنشورات زمني (`CHRONOLOGICAL`)، والتعليقات «الأحدث».
+   لو فرز التعليقات مانجحش، السكربت **بيوقف** بـ `SystemExit` بدل ما يسحب ترتيب غلط.
+   ماتخليهوش يكمل بصمت.
+
+5. **الضغط على عناصر فيسبوك لازم يكون حقيقي** (`locator.click()`)، مش `element.click()`
+   من JavaScript، في فتح قوائم الفرز. الـ React handlers مابتردّش على النقر الصناعي.
+   استثناء: `expand_comments` بتستخدم JS عن قصد لأنها بتضغط عشرات الأزرار في لفة واحدة.
+
+---
+
+## البنية
+
+| الملف | الوظيفة |
+| --- | --- |
+| `launch_browser.py` | يفتح كروميوم Playwright على البروفايل الثابت + منفذ CDP. بيحلّ مسار كروميوم ديناميكيًا |
+| `start-cdp-browser.cmd` | wrapper بيشغّل اللي فوق من الـ venv |
+| `fb_groups_to_sheet.py` | السحب: جروب → منشورات → تعليقات → الشيت |
+| `fb_return_replies.py` | الرد: عمود `reply` في الشيت → تعليقات فيسبوك |
+| `browser_debug.py` | التشخيص: HTML، كونسول، أخطاء، شبكة، صور، storage |
+| `facebook_sheet_receiver.gs` | Apps Script: upsert بـ `post_id` / `comment_id` بدون تكرار |
+| `cdp-ready.html` | صفحة البداية في النافذة المتحكَّم فيها |
+
+## التشغيل
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m playwright install chromium
+
+.\start-cdp-browser.cmd                      # افتح المتصفح، وسجّل دخول فيسبوك مرة واحدة
+.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL --min-posts 1 --max-posts 5 --min-comments 1 --max-comments 30
+.venv\Scripts\python.exe fb_return_replies.py
+```
+
+كل السكربتات بتتوصل على المتصفح المفتوح بـ `connect_over_cdp`؛ مفيش سكربت بيفتح متصفح لوحده
+غير `launch_browser.py`.
+
+## التشخيص لما حاجة تبوظ
+
+فيسبوك بيغيّر الـ DOM من غير سابق إنذار، فأغلب الأعطال سببها selector بار.
+التشخيص بيوصل لده في خطوة واحدة:
+
+```powershell
+# دَمب تلقائي عند أي فشل أثناء الشغل
+.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL ... --debug
+.venv\Scripts\python.exe fb_return_replies.py --debug
+
+# لقطة يدوية للحالة الحالية
+.venv\Scripts\python.exe browser_debug.py snapshot
+.venv\Scripts\python.exe browser_debug.py snapshot --url "https://www.facebook.com/groups/123"
+
+# مراقبة لايف وإنت بتتصرف في المتصفح بإيدك
+.venv\Scripts\python.exe browser_debug.py watch
+```
+
+المخرجات في `debug/<الوقت>-<اسم>-<سبب>/`:
+`summary.txt` (ابدأ منه)، `page.html`، `page.png`، `page.txt`،
+`console.jsonl`، `errors.jsonl`، `network.jsonl`، `browser-log.jsonl`،
+`lifecycle.jsonl`، `storage.json`، `meta.json`.
+
+في الكود:
+
+```python
+from browser_debug import PageRecorder, recording
+
+with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل استثناء
+    page.goto(url)
+    rec.mark("after-goto")
+```
+
+`PageRecorder.dump()` **مابيرفعش استثناء أبدًا** — لازم يفضل يشتغل والصفحة بايظة.
+لما تزوّد التقاط جديد، حافظ على الخاصية دي.
+
+## أسرار
+
+`TOKEN` ورابط الـ Apps Script `/exec` **مكتوبين في الكود** في
+`fb_groups_to_sheet.py` و `fb_return_replies.py` و `facebook_sheet_receiver.gs`،
+والريبو عام. ده قرار صاحب المشروع وهو عارفه.
+`fb_groups_to_sheet.py` بيقرأ `FB_SHEET_TOKEN` من البيئة لو موجود.
+لو اتقرر التدوير: غيّر التوكن في الـ `.gs`، انشر deployment جديد، وحدّث الرابط في السكربتين.
+
+---
+
+## سجل التحديثات
+
+### 2026-10-21 — أدوات تشخيص المتصفح
+- **جديد `browser_debug.py`**: يلتقط HTML، كونسول (بمكانه في الكود)، استثناءات غير ملتقطة
+  بـ stack trace، طلبات فاشلة وردود 4xx/5xx، سجل المتصفح من CDP
+  (`Log.entryAdded` — بيجيب أخطاء CORS و CSP و mixed content اللي الكونسول العادي بيفوّتها)،
+  صورة full-page، النص الظاهر، localStorage/sessionStorage، وملخص بشري.
+  أوامر: `snapshot` و `watch`. و API: `PageRecorder` و `recording()`.
+  **ليه:** لما فيسبوك يغيّر الـ DOM، السكربت بيفشل بـ `no-comment` أو `no-reply-button`
+  من غير أي دليل. كان لازم لقطة كاملة لحظة الفشل بدل إعادة التشغيل والتخمين.
+- **`--debug` في `fb_groups_to_sheet.py` و `fb_return_replies.py`.**
+  في السحب، الالتقاط بيمسك `BaseException` مش `Exception` — لأن فشل فرز التعليقات
+  بيرفع `SystemExit`، وده بالظبط الفشل اللي محتاجين نشوف صفحته.
+  في الردود، بيعمل دَمب للحالات اللي بتفشل من غير استثناء (`no-comment` / `no-reply-button`).
+- **`debug/` مستبعد من git** — فيه HTML وصور لصفحات مسجّل فيها دخول.
+- **`FB_CDP` في `fb_return_replies.py`** + `--cdp`، بدل عنوان مكتوب في الكود،
+  توحيدًا مع باقي السكربتات.
+- الكوكيز في الدَمب: **أسماء ونطاقات بس، من غير قيم.** القيم بتساوي الجلسة نفسها.
+
+### 2026-10-21 — إعداد البيئة والريبو
+- **venv** في `.venv` + `requirements.txt` (playwright 1.64، websocket-client، requests)،
+  وكروميوم Playwright منزّل (build 1248).
+- **`launch_browser.py` جديد** بيحلّ مسار كروميوم من Playwright نفسه.
+  **ليه:** `start-cdp-browser.cmd` كان فيه `chromium-1234` مكتوب في الكود،
+  والمنزّل بقى 1248 — فاللانشر كان بيوقع بعد أي تحديث لـ Playwright.
+  كمان بيتأكد إن المنفذ رد قبل ما يقول جاهز، ومابيفتحش متصفح تاني لو واحد شغال.
+- `start-cdp-browser.cmd` بقى wrapper على اللي فوق، بيستخدم بايثون الـ venv.
+- **`.gitignore`**: `profile/` و `dumps/` و `.venv/`.
+- **`README.md`** جديد، و **git init على `main`**، ورفع لريبو عام `CommentsFacebook`.
+- متأكد إنه ماشي: Playwright اتوصل بـ CDP على المتصفح الشغال، و 9 كوكيز فيسبوك
+  موجودة في البروفايل — يعني الجلسة بتفضل محفوظة فعلًا.

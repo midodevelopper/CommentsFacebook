@@ -9,6 +9,10 @@ profile/
 # Scrape output: real users' names, IDs and comment text
 dumps/
 
+# لقطات التشخيص: HTML وصور لصفحات مسجّل فيها دخول
+# Diagnostics captures: HTML + screenshots of logged-in pages
+debug/
+
 # البيئة الافتراضية
 .venv/
 venv/
