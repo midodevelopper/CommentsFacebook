@@ -67,11 +67,22 @@ def test_collect_empty_group(page, fake_fb):
     assert scraper.collect_post_ids(page, G, 5) == ([], "")
 
 
-def test_collect_includes_other_groups_posts_found_in_feed(page, fake_fb):
-    """Characterization (defect D-08): links to another group's posts are collected as this group's."""
+def test_collect_ignores_other_groups_posts_in_feed(page, fake_fb):
+    """Fixed D-08: links to another group's posts used to be collected as this group's."""
     fake_fb.add_group(Group(G, extra_links=["https://www.facebook.com/groups/999/posts/5555/"]), [Post("1")])
     found, _ = scraper.collect_post_ids(page, G, 5)
-    assert found == ["1", "5555"]
+    assert found == ["1"]
+
+
+def test_collect_ignores_notifications_panel(page, fake_fb):
+    """D-08 as seen live 2026-10-21: the Notifications panel (banner > dialog) came first in the DOM
+    and supplied 3 of 5 'post ids' from other groups; the run then failed on the first one."""
+    fake_fb.add_group(Group(G, notification_links=[
+        "https://www.facebook.com/groups/111111111111111/posts/222222222222222/",
+        f"https://www.facebook.com/groups/{G}/posts/7777/",            # same group, but not in the feed
+    ]), [Post("1"), Post("2")])
+    found, _ = scraper.collect_post_ids(page, G, 5)
+    assert found == ["1", "2"]
 
 
 def test_collect_ignores_non_post_links(page, fake_fb):
@@ -115,8 +126,26 @@ def test_sort_already_newest_does_not_click(page, fake_fb):
     assert clicks(page) == []
 
 
-def test_sort_missing_control(page, fake_fb):
-    open_post(page, fake_fb, Post("1", sort_mode="none"))
+def test_sort_missing_control_with_comments(page, fake_fb):
+    open_post(page, fake_fb, Post("1", comments=comments(2), sort_mode="none"))
+    assert scraper.sort_comments_newest(page) == "missing"
+
+
+def test_sort_no_comments_post_has_no_control(page, fake_fb):
+    """Fixed D-20: Facebook shows no sort control on a post with zero comments."""
+    open_post(page, fake_fb, Post("1", comments=[], sort_mode="none"))
+    assert scraper.sort_comments_newest(page) == "no-comments"
+
+
+@pytest.mark.parametrize("lang", ["ar", "en"])
+def test_sort_no_comments_text_in_both_languages(page, fake_fb, lang):
+    open_post(page, fake_fb, Post("1", comments=[], sort_mode="none", lang=lang))
+    assert scraper.no_comments_shown(page) is True
+
+
+def test_sort_zero_comments_without_the_text_is_still_missing(page, fake_fb):
+    """The strict guard stays: no control and no explicit 'no comments' text is a failure."""
+    open_post(page, fake_fb, Post("1", comments=[], sort_mode="none", no_comments_text=False))
     assert scraper.sort_comments_newest(page) == "missing"
 
 
@@ -266,12 +295,12 @@ def test_snapshot_extracts_post_header_and_comments(page, fake_fb):
     assert "comment_id=501" in c["link"] and "__tn__" not in c["link"]
 
 
-def test_snapshot_clean_keeps_cft_array_tracking_param(page, fake_fb):
-    """Characterization (defect D-10): clean() deletes '__cft__' but Facebook sends '__cft__[0]'."""
+def test_snapshot_clean_strips_all_tracking_params(page, fake_fb):
+    """Fixed D-10: clean() deleted '__cft__' but Facebook sends '__cft__[0]', which stayed."""
     open_post(page, fake_fb, Post("77", comments=[Comment(id="501", author_id="111")], sort_mode="newest"))
     c = scraper.visible_snapshot(page, G, "77")["comments"][0]
-    assert "__cft__%5B0%5D=AZtrackingtoken" in c["author_url"]
-    assert "__tn__" not in c["author_url"]
+    assert c["author_url"] == f"https://www.facebook.com/groups/{G}/user/111/"
+    assert "__" not in c["link"]
 
 
 def test_snapshot_comment_without_user_link(page, fake_fb):
@@ -298,10 +327,13 @@ def test_snapshot_no_message_no_title(page, fake_fb):
     assert snap["post_content"] == "" and snap["content_kind"] == ""
 
 
-def test_snapshot_external_link_replaces_text(page, fake_fb):
-    open_post(page, fake_fb, Post("77", message="نص", external_url="https://example.org/a?b=1", sort_mode="newest"))
+def test_snapshot_external_link_keeps_text_separately(page, fake_fb):
+    """Fixed: the link used to replace the post's text entirely."""
+    open_post(page, fake_fb, Post("77", message="نص", external_url="https://example.org/a?b=1&fbclid=IwZX",
+                                  sort_mode="newest"))
     snap = scraper.visible_snapshot(page, G, "77")
-    assert snap["post_content"] == "https://example.org/a?b=1" and snap["content_kind"] == "link"
+    assert snap["post_content"] == snap["media_url"] == "https://example.org/a?b=1"   # fbclid stripped
+    assert snap["content_kind"] == "link" and snap["text"] == "نص"
 
 
 def test_snapshot_video_wins_over_link(page, fake_fb):
@@ -309,6 +341,15 @@ def test_snapshot_video_wins_over_link(page, fake_fb):
                                   sort_mode="newest"))
     snap = scraper.visible_snapshot(page, G, "77")
     assert snap["post_content"] == "https://video.example/v.mp4" and snap["content_kind"] == "video"
+    assert snap["text"] == "نص المنشور"
+
+
+def test_snapshot_blob_video_is_still_a_video(page, fake_fb):
+    """Live 2026-10-21: video src is a blob:, so the old code fell back to kind 'text'."""
+    open_post(page, fake_fb, Post("77", video_src="blob:https://www.facebook.com/abc", sort_mode="newest"))
+    snap = scraper.visible_snapshot(page, G, "77")
+    assert snap["content_kind"] == "video" and snap["media_url"] == ""
+    assert snap["post_content"] == "نص المنشور"
 
 
 def test_snapshot_nested_reply_text_leaks_into_parent(page, fake_fb):
@@ -357,7 +398,8 @@ def test_scrape_post_newest_order_and_contract(page, fake_fb):
     assert [c["comment_id"] for c in out["comments"]] == ids(cs)          # newest-first, not "relevant"
     assert out["comment_sort"] == "الأحدث"
     assert list(out.keys()) == ["group_id", "post_id", "permalink", "author", "author_id", "author_url",
-                                "text", "post_content", "content_kind", "created_time", "url",
+                                "text", "post_content", "content_kind", "media_url", "created_time",
+                                "created_time_raw", "url",
                                 "comment_sort", "comments_found", "replies_found", "comments_shortfall",
                                 "comments_over_max", "capture_mode", "sheet_batches", "comments"]
     assert out["permalink"] == out["url"] == f"https://www.facebook.com/groups/{G}/posts/77/"
@@ -499,17 +541,42 @@ def test_scrape_post_is_read_only(page, fake_fb):
     assert all(u.startswith("https://www.facebook.com/groups/") for u in fake_fb.navigations())
 
 
-def test_scrape_post_escape_closes_post_dialog(page, fake_fb):
-    """Characterization (defect D-19, seen live 2026-10-21): scrape_post presses Escape before each
-    sort attempt. Where Facebook shows the post as a dialog, Escape closes it and navigates to the
-    home page, so the sort control is never found and the whole run stops."""
+def test_scrape_post_survives_escape_closing_the_post_dialog(page, fake_fb):
+    """Fixed D-19 (seen live 2026-10-21): scrape_post pressed Escape before each sort attempt; where
+    Facebook shows the post as a dialog, Escape closed it and went to the home page."""
+    cs = comments(3)
+    out = scrape(page, fake_fb, Post("77", comments=cs, escape_closes=True))
+    assert [c["comment_id"] for c in out["comments"]] == ids(cs)
+    assert page.url.endswith("/posts/77/")
+
+
+def test_scrape_post_stops_with_clear_reason_if_facebook_leaves_the_post(page, fake_fb, monkeypatch):
+    def leave(p):
+        p.goto("https://www.facebook.com/")
+        return "missing"
+    monkeypatch.setattr(scraper, "sort_comments_newest", leave)
     with pytest.raises(SystemExit) as exc:
-        scrape(page, fake_fb, Post("77", comments=comments(3), escape_closes=True))
+        scrape(page, fake_fb, Post("77", comments=comments(2)))
+    assert "نقل الصفحة بعيد عن المنشور 77" in str(exc.value)
+
+
+def test_scrape_post_without_comments_is_archived(page, fake_fb):
+    """Fixed D-20 (seen live: 4 of 5 newest posts had no comments, each one stopped the run)."""
+    out = scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", message="منشور جديد"))
+    assert out["comment_sort"] == "no-comments"
+    assert out["comments"] == [] and out["text"] == "منشور جديد"
+
+
+def test_scrape_post_without_comments_is_fast(page, fake_fb, monkeypatch):
+    """No 5-round scroll loop when Facebook says there are no comments: one header snapshot."""
+    calls = []
+    real = scraper.visible_snapshot
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or real(*a))
+    scrape(page, fake_fb, Post("77", comments=[], sort_mode="none"))
+    assert len(calls) == 1
+
+
+def test_scrape_post_zero_comments_without_text_still_stops(page, fake_fb):
+    with pytest.raises(SystemExit) as exc:
+        scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", no_comments_text=False))
     assert str(exc.value).endswith(": missing")
-    assert page.url == "https://www.facebook.com/"
-
-
-def test_scrape_post_post_without_comments_has_no_sort_control(page, fake_fb):
-    """Characterization: a post with zero comments and no sort control stops the run (strict guard)."""
-    with pytest.raises(SystemExit):
-        scrape(page, fake_fb, Post("77", comments=[], sort_mode="none"))

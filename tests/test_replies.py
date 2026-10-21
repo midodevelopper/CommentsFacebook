@@ -32,11 +32,14 @@ def test_constants():
 
 
 @pytest.mark.cli
-def test_token_ignores_fb_sheet_token_env():
-    """Characterization (defect D-05): unlike the scraper, the reply script hardcodes TOKEN."""
+def test_token_reads_fb_sheet_token_env_like_the_scraper():
+    """Fixed D-05: the reply script used to hardcode TOKEN and ignore FB_SHEET_TOKEN."""
     code = "import fb_return_replies as m; print(m.TOKEN)"
     out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60,
                          env={**os.environ, "FB_SHEET_TOKEN": "from-env"})
+    assert out.stdout.strip() == "from-env"
+    env = {k: v for k, v in os.environ.items() if k != "FB_SHEET_TOKEN"}
+    out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60, env=env)
     assert out.stdout.strip() == "CommentSecrets"
 
 
@@ -261,11 +264,21 @@ def test_main_keyboard_interrupt_is_not_swallowed(monkeypatch, loop):
 
 
 @pytest.mark.unit
-def test_main_ignores_mark_replied_failure(monkeypatch, loop):
-    """Characterization (defect D-04): the mark_replied answer is printed, never checked."""
+@pytest.mark.parametrize("answer", [{"ok": False, "error": "bad token"}, {"ok": True, "marked": 0}])
+def test_main_warns_when_mark_replied_fails(monkeypatch, loop, capsys, answer):
+    """Fixed D-04: the mark_replied answer used to be printed and never checked. The loop still
+    continues (the reply is already on Facebook), but the gap is now reported."""
+    loop["pending"]["replies"] = [item("1"), item("2")]
+    monkeypatch.setattr(replies, "sheet_post", lambda payload: answer)
+    run(monkeypatch)
+    err = capsys.readouterr().err
+    assert "1 اتنشر بس ماتعلّمش posted" in err and "2 اتنشر بس ماتعلّمش posted" in err
+
+
+def test_main_no_warning_when_marked(monkeypatch, loop, capsys):
     loop["pending"]["replies"] = [item("1")]
-    monkeypatch.setattr(replies, "sheet_post", lambda payload: {"ok": False, "error": "bad token"})
-    run(monkeypatch)    # no exception, nothing retried
+    run(monkeypatch)
+    assert "ماتعلّمش" not in capsys.readouterr().err
 
 
 @pytest.mark.unit
@@ -420,13 +433,29 @@ def test_post_one_uses_last_textbox_on_page(page, fake_fb):
 
 
 @pytest.mark.browser
-def test_post_one_comment_id_prefix_collision(page, fake_fb):
-    """Characterization (defect D-01): matching uses href.includes('comment_id=' + id), so id '123'
-    matches a comment whose id is '1234…' that appears earlier in the DOM."""
+def test_post_one_exact_comment_id_match(page, fake_fb):
+    """Fixed D-01: matching used href.includes('comment_id=' + id), so id '123' replied to the
+    comment '1234' that appeared earlier in the DOM."""
     cs = [Comment(id="1234"), Comment(id="123")]
     setup_post(fake_fb, cs=cs)
     assert replies.post_one(page, item("123")) == "posted"
-    assert sent(page)[0]["comment_id"] == "1234"
+    assert sent(page)[0]["comment_id"] == "123"
+
+
+@pytest.mark.browser
+def test_post_one_parent_id_does_not_match_its_replies_links(page, fake_fb):
+    """Replying to a parent must target the parent, not a reply whose link also carries comment_id=parent."""
+    cs = [Comment(id="500", replies=[Comment(id="501")])]
+    setup_post(fake_fb, cs=cs)
+    page.goto("about:blank")
+    assert replies.post_one(page, item("500")) == "posted"
+    assert sent(page)[0]["comment_id"] == "500"
+
+
+@pytest.mark.browser
+def test_post_one_only_prefix_present_is_no_comment(page, fake_fb):
+    setup_post(fake_fb, cs=[Comment(id="1234")])
+    assert replies.post_one(page, item("123")) == "no-comment"
 
 
 @pytest.mark.browser

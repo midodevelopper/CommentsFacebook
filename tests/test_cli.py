@@ -70,15 +70,15 @@ def test_scraper_unreachable_cdp_fails(tmp_path):
 
 @pytest.mark.skipif(locale.getpreferredencoding(False).lower().replace("-", "") in ("utf8", "cp65001"),
                     reason="only reproducible where the locale code page is not UTF-8")
-def test_arabic_print_crashes_when_stdout_is_piped_without_utf8():
-    """Characterization (defect D-15): scripts print Arabic; with stdout redirected (Task Scheduler,
-    `> log.txt`) and no PYTHONUTF8/PYTHONIOENCODING, print() raises UnicodeEncodeError."""
+def test_arabic_print_works_when_stdout_is_piped_without_utf8():
+    """Fixed D-15: scripts print Arabic; with stdout redirected (Task Scheduler, `> log.txt`) and no
+    PYTHONUTF8/PYTHONIOENCODING, print() used to raise UnicodeEncodeError. main() now forces UTF-8."""
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONIOENCODING", "PYTHONUTF8")}
-    code = ("import launch_browser as m; m.cdp_version = lambda port, timeout=2.0: {'Browser': 'x'}; "
-            "raise SystemExit(m.launch(1))")
+    code = ("import sys, launch_browser as m; m.cdp_version = lambda port, timeout=2.0: {'Browser': 'x'}; "
+            "sys.argv = ['launch_browser.py', '--port', '1']; raise SystemExit(m.main())")
     out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, capture_output=True, env=env, timeout=60)
-    assert out.returncode == 1
-    assert b"UnicodeEncodeError" in out.stderr
+    assert out.returncode == 0, out.stderr
+    assert "شغال".encode("utf-8") in out.stdout
 
 
 # ---------------------------------------------------------------- browser_debug.py

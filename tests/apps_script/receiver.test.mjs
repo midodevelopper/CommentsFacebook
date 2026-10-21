@@ -148,11 +148,14 @@ test('doPost takes the lock for 30s and always releases it', () => {
   assert.equal(r.lock.released, 3);
 });
 
-test('doPost lock timeout throws instead of returning JSON', () => {
-  // Characterization (defect D-06): waitLock is outside the try, so a busy lock is an uncaught
-  // exception: Apps Script answers with an HTML error page, not {"ok": false}.
+test('doPost lock timeout returns ok false JSON and writes nothing', () => {
+  // Fixed D-06: waitLock moved inside the try. Before, a busy lock escaped as an HTML error page.
   const r = loadReceiver({ lockTimeout: true });
-  assert.throws(() => r.context.doPost({ postData: { contents: JSON.stringify(body([])) } }), /Lock timeout/);
+  const out = r.post(body([post('1', [comment('9')])]));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /Lock timeout/);
+  assert.equal(r.ss.getSheetByName('Posts'), null);
+  assert.equal(r.lock.released, 1);
 });
 
 // ------------------------------------------------------------ doPost: upsert
@@ -393,20 +396,33 @@ test('headers: missing columns are appended, existing order and extra columns ke
   assert.deepEqual(head.slice(0, 3), ['comment_id', 'my_notes', 'text']);
   assert.equal(head.length, 3 + 15);
   const row = cs.records()[0];
-  assert.equal(row.my_notes, '');          // characterization: upsert rewrites the whole row, clearing unknown columns
+  assert.equal(row.my_notes, 'note');      // fixed D-20b: owner's own columns survive a rescrape
   assert.equal(row.text, 'new');
 });
 
-test('headers: blank header cell in the middle shifts headers left', () => {
-  // Characterization (defect D-14): ensureHeaders_ filters out blank header cells, so headers to the
-  // right of a gap move one column left while the data under them does not.
+test('headers: owner column on a new row stays blank, on update keeps its value', () => {
+  const r = loadReceiver();
+  r.post(body([post('10', [comment('901')])]));
+  const cs = r.ss.getSheetByName('Comments');
+  const width = cs.getLastColumn();
+  cs.getRange(1, width + 1).setValue('my_notes');
+  cs.getRange(2, width + 1).setValue('call back');
+  r.post(body([post('10', [comment('901', { text: 'v2' }), comment('902')])]));
+  const rows = Object.fromEntries(cs.records().map(x => [x.comment_id, x]));
+  assert.equal(rows['901'].my_notes, 'call back');
+  assert.equal(rows['901'].text, 'v2');
+  assert.equal(rows['902'].my_notes, '');
+});
+
+test('headers: blank header cell in the middle stays in place', () => {
+  // Fixed D-14: blank header cells used to be filtered out, shifting later headers off their data.
   const r = loadReceiver();
   const cs = r.ss.insertSheet('Comments');
   cs.appendRow(['comment_id', '', 'text']);
   cs.appendRow(['901', 'x', 'kept text']);
   r.call('ensureHeaders_', cs, [...r.consts.COMMENT_HEAD]);
-  assert.deepEqual(cs.table()[0].slice(0, 2), ['comment_id', 'text']);
-  assert.equal(cs.records()[0].text, 'x');
+  assert.deepEqual(cs.table()[0].slice(0, 3), ['comment_id', '', 'text']);
+  assert.equal(cs.records()[0].text, 'kept text');
 });
 
 test('dedupe: pre-existing duplicate rows are removed keeping the first', () => {

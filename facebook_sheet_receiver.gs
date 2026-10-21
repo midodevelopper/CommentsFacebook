@@ -65,8 +65,9 @@ function doGet(e) {
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
   try {
+    // جوه try: لو القفل مشغول، الرد يبقى JSON {ok:false} مش صفحة خطأ HTML
+    lock.waitLock(30000);
     const body = JSON.parse(e.postData.contents || '{}');
     if (body.token !== TOKEN) return json_({ok: false, error: 'bad token'});
     if (body.action === 'mark_replied') {
@@ -101,7 +102,7 @@ function doPost(e) {
       const postId = idText_(p.post_id);
       if (!postId || seenPosts[postId]) return;
       seenPosts[postId] = true;
-      const postRow = rowFrom_(postCols, {
+      const postValues = {
         post_id: postId,
         group_id: idText_(body.group_id || p.group_id || ''),
         author: p.author || '',
@@ -113,14 +114,14 @@ function doPost(e) {
         'post content': p['post content'] || p.post_content || p.text || '',
         comment_sort: p.comment_sort || '',
         received_at: now
-      });
-      upsert_(ps, postId, postRow, postCols) ? np++ : up++;
+      };
+      upsert_(ps, postId, rowFrom_(postCols, postValues), postCols, Object.keys(postValues)) ? np++ : up++;
 
       (p.comments || []).forEach(c => {
         const commentId = idText_(c.comment_id);
         if (!commentId || seenComments[commentId]) return;
         seenComments[commentId] = true;
-        const commentRow = rowFrom_(commentCols, {
+        const commentValues = {
           comment_id: commentId,
           post_id: postId,
           group_id: idText_(body.group_id || p.group_id || ''),
@@ -138,8 +139,8 @@ function doPost(e) {
           reply: c.reply || '',
           reply_status: c.reply_status || '',
           received_at: now
-        });
-        upsert_(cs, commentId, commentRow, commentCols) ? nc++ : uc++;
+        };
+        upsert_(cs, commentId, rowFrom_(commentCols, commentValues), commentCols, Object.keys(commentValues)) ? nc++ : uc++;
       });
     });
     return json_({
@@ -165,16 +166,22 @@ function idText_(value) {
   return String(value).replace(/^'/, '').trim();
 }
 
-function upsert_(sh, id, row, cols) {
+// keys: أسماء الأعمدة اللي الصف ده بيكتبها. أي عمود تاني (عمود ضافه صاحب الشيت) بيفضل زي ما هو.
+function upsert_(sh, id, row, cols, keys) {
   const key = idText_(id);
   if (!key) throw new Error('missing id');
   const hit = findIdRow_(sh, key);
   if (hit) {
+    const current = sh.getRange(hit, 1, 1, row.length).getValues()[0];
+    const owned = {};
+    (keys || Object.keys(cols)).forEach(name => { if (cols[name] !== undefined) owned[cols[name]] = true; });
+    for (let i = 0; i < row.length; i++) {
+      if (!owned[i]) row[i] = current[i];
+    }
     KEEP_IF_BLANK.forEach(name => {
       const index = cols[name];
       if (index === undefined) return;
-      const current = sh.getRange(hit, index + 1).getValue();
-      if (!row[index] && current) row[index] = current;
+      if (!row[index] && current[index]) row[index] = current[index];
     });
     sh.getRange(hit, 1, 1, row.length).setNumberFormat('@');
     sh.getRange(hit, 1, 1, row.length).setValues([row]);
@@ -235,7 +242,10 @@ function ensureHeaders_(sh, head) {
   const current = sh.getRange(1, 1, 1, width).getValues()[0].map(v => String(v || ''));
   const missing = head.filter(name => current.indexOf(name) === -1);
   if (!missing.length && current[0]) return;
-  const next = current[0] ? current.filter(Boolean).concat(missing) : head;
+  // الفراغات اللي في النص بتفضل مكانها: لو اتشالت، العناوين اللي بعدها بتزحف عن بياناتها
+  let lastUsed = current.length - 1;
+  while (lastUsed >= 0 && !current[lastUsed]) lastUsed--;
+  const next = current[0] ? current.slice(0, lastUsed + 1).concat(missing) : head;
   sh.getRange(1, 1, 1, next.length).setValues([next]);
   sh.getRange(1, 1, 1, next.length).setFontWeight('bold');
   sh.setFrozenRows(1);

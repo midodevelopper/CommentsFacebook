@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -110,10 +111,12 @@ def test_comment_id_regexes():
     assert scraper.RCID_RE.search(link).group(1) == "222"
 
 
-def test_cid_re_matches_inside_reply_comment_id_when_params_reversed():
-    """Characterization (defect D-07): CID_RE is not anchored to a parameter boundary."""
+def test_cid_re_anchored_to_parameter_boundary():
+    """Fixed D-07: CID_RE used to match inside reply_comment_id= when the params were reversed."""
     link = "https://x/?reply_comment_id=222&comment_id=111"
-    assert scraper.CID_RE.search(link).group(1) == "222"
+    assert scraper.CID_RE.search(link).group(1) == "111"
+    assert scraper.RCID_RE.search(link).group(1) == "222"
+    assert scraper.CID_RE.search("https://x/?xcomment_id=5") is None
 
 
 @pytest.mark.parametrize("text", [
@@ -158,15 +161,23 @@ def link(cid, rcid=None, extra="&__cft__[0]=AZ&__tn__=R"):
 def test_normalize_top_level_comment():
     raw = {"link": link("901"), "author": "  أحمد  ", "author_id": "1001",
            "author_url": "https://www.facebook.com/groups/G/user/1001/", "text": "  مرحبا \n",
-           "created_time": " ٥ د ", "aria_label": "تعليق بواسطة أحمد"}
+           "created_time": "الأربعاء، 21 أكتوبر 2026 الساعة 3:38 م", "aria_label": "تعليق بواسطة أحمد"}
     assert scraper.normalize_comment(raw, G, P) == {
         "group_id": G, "post_id": P, "comment_id": "901",
         "parent_comment_id": "", "parent_id": "", "reply_comment_id": "", "is_reply": False,
         "reply_target_id": "901", "author": "أحمد", "author_id": "1001",
         "author_url": "https://www.facebook.com/groups/G/user/1001/", "text": "مرحبا",
-        "created_time": "٥ د", "aria_label": "تعليق بواسطة أحمد",
+        "created_time": "2026-10-21 15:38",
+        "created_time_raw": "الأربعاء، 21 أكتوبر 2026 الساعة 3:38 م",
+        "has_media": False, "aria_label": "تعليق بواسطة أحمد",
         "permalink": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id=901",
     }
+
+
+def test_normalize_relative_time_becomes_timestamp_and_keeps_raw():
+    c = scraper.normalize_comment({"link": link("901"), "created_time": " ٥ د "}, G, P)
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", c["created_time"])
+    assert c["created_time_raw"] == "٥ د"
 
 
 def test_normalize_reply_comment():
@@ -260,7 +271,8 @@ def test_sheet_post_payload_contract():
     (p,) = payload["posts"]
     assert list(p.keys()) == ["post_id", "author", "author_id", "text", "post content", "created_time",
                               "url", "permalink", "comment_sort", "comments"]
-    assert p["text"] == p["post content"] == "content"
+    assert p["text"] == "t"                    # the post's own words
+    assert p["post content"] == "content"      # media/link when present, else the text
     assert p["comments"][0]["post content"] == "content"
     assert list(p["comments"][0].keys()) == SHEET_COMMENT_KEYS
 
@@ -298,15 +310,27 @@ def test_sheet_post_sends_utf8_json_post(sheet):
     assert json.loads(req["body"]) == {"token": "t", "text": "عربي 🌙"}
 
 
-def test_sheet_post_returns_raw_text_even_when_apps_script_says_not_ok(sheet):
-    """Characterization (defect D-02): {"ok": false} (bad token, script error) is not detected."""
+def test_sheet_post_stops_when_apps_script_says_not_ok(sheet):
+    """Fixed D-02: {"ok": false} (bad token, script error) used to be printed and ignored."""
     sheet.respond(body='{"ok":false,"error":"bad token"}')
-    assert scraper.sheet_post({"token": "wrong"}) == '{"ok":false,"error":"bad token"}'
+    with pytest.raises(SystemExit) as exc:
+        scraper.sheet_post({"token": "wrong"})
+    assert "bad token" in str(exc.value)
 
 
-def test_sheet_post_returns_non_json_body_unchanged(sheet):
+def test_sheet_post_stops_on_non_json_answer(sheet):
+    """An HTML page from Apps Script (uncaught error, busy lock) is a failure, not a success."""
     sheet.respond(body="<html>Google error page</html>", content_type="text/html")
-    assert scraper.sheet_post({}) == "<html>Google error page</html>"
+    with pytest.raises(SystemExit) as exc:
+        scraper.sheet_post({})
+    assert "Google error page" in str(exc.value)
+
+
+@pytest.mark.parametrize("body", ['{"posts_new": 1}', "[]", '"ok"'])
+def test_sheet_post_stops_without_explicit_ok_true(sheet, body):
+    sheet.respond(body=body)
+    with pytest.raises(SystemExit):
+        scraper.sheet_post({})
 
 
 def test_sheet_post_http_error_raises_systemexit_with_code_and_detail(sheet):
@@ -381,9 +405,12 @@ def test_parse_args_range_validation(monkeypatch, override, message):
     assert message in str(exc.value)
 
 
-def test_parse_args_batch_size_not_validated(monkeypatch):
-    """Characterization: --batch-size 0 is accepted (archive_group would then fail on range step 0)."""
-    assert parse(monkeypatch, *BASE, "--batch-size", "0").batch_size == 0
+@pytest.mark.parametrize("size", ["0", "-5"])
+def test_parse_args_rejects_batch_size_below_1(monkeypatch, size):
+    """Fixed: --batch-size 0 used to be accepted and crash later on range(..., 0)."""
+    with pytest.raises(SystemExit) as exc:
+        parse(monkeypatch, *BASE, "--batch-size", size)
+    assert "batch-size" in str(exc.value)
 
 
 @pytest.mark.parametrize("missing", ["--group", "--min-posts", "--max-posts", "--min-comments", "--max-comments"])
@@ -601,12 +628,19 @@ def test_main_writes_group_dump_and_run_summary(monkeypatch, main_env):
     assert main_env["sent"] == []
 
 
-def test_main_dump_files_contain_the_sheet_token(monkeypatch, main_env):
-    """Characterization (security finding S-02): the Apps Script token is written into every local dump."""
+def test_main_dump_files_do_not_contain_the_sheet_token(monkeypatch, main_env):
+    """Fixed S-02: the Apps Script token used to be written into every local dump."""
     monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
     run_main(monkeypatch, *BASE, "--dry")
-    text = (main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8")
-    assert json.loads(text)["token"] == scraper.TOKEN
+    for f in main_env["dumps"].iterdir():
+        assert scraper.TOKEN not in f.read_text(encoding="utf-8"), f.name
+    assert json.loads((main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8"))["group_id"] == "1"
+
+
+def test_main_still_sends_token_to_sheet(monkeypatch, main_env):
+    monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
+    run_main(monkeypatch, *BASE)
+    assert main_env["sent"][0]["token"] == scraper.TOKEN
 
 
 def test_main_dump_keeps_unicode_unescaped(monkeypatch, main_env):
@@ -648,7 +682,23 @@ def test_main_debug_dumps_on_systemexit_and_reraises(monkeypatch, main_env):
     assert rec.marks == ["group https://www.facebook.com/groups/1"]
     assert rec.dumps[0][0] == "failed" and isinstance(rec.dumps[0][1], SystemExit)
     assert rec.detached and main_env["page"].closed
-    assert not (main_env["dumps"] / "run-20261021-120000.json").exists()
+    # fixed D-18: the run summary is written even when the run fails, with the reason
+    summary = json.loads((main_env["dumps"] / "run-20261021-120000.json").read_text(encoding="utf-8"))
+    assert summary == [{"failed": "SystemExit: فرز التعليقات مش «الأحدث»"}]
+
+
+def test_main_successful_traced_run_makes_a_final_dump(monkeypatch, main_env):
+    """Fixed D-16: with --debug --trace and no failure, the trace used to be discarded."""
+    monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
+    run_main(monkeypatch, *BASE, "--dry", "--debug", "--trace")
+    (rec,) = FakeRecorder.instances
+    assert [d[0] for d in rec.dumps] == ["complete"]
+
+
+def test_main_successful_untraced_debug_run_makes_no_dump(monkeypatch, main_env):
+    monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
+    run_main(monkeypatch, *BASE, "--dry", "--debug")
+    assert FakeRecorder.instances[0].dumps == []
 
 
 def test_main_without_debug_creates_no_recorder(monkeypatch, main_env):
@@ -664,9 +714,9 @@ def test_main_failure_without_debug_still_closes_page(monkeypatch, main_env):
     assert main_env["page"].closed
 
 
-def test_main_one_failing_group_aborts_the_rest_and_the_run_summary(monkeypatch, main_env):
-    """Characterization (defect D-18): groups run in one loop; a failure in group 2 skips group 3
-    and no run-*.json is written, though group 1's dump is."""
+def test_main_one_failing_group_stops_the_run_but_summary_is_kept(monkeypatch, main_env):
+    """Groups run in one loop; a failure in group 2 still skips group 3 (strict stop kept).
+    Fixed D-18: run-*.json is now written with group 1's result and the failure reason."""
     seen = []
 
     def archive(page, url, *a, **k):
@@ -681,7 +731,8 @@ def test_main_one_failing_group_aborts_the_rest_and_the_run_summary(monkeypatch,
                  "--group", "https://www.facebook.com/groups/3", "--dry")
     assert seen == ["1", "2"]
     assert (main_env["dumps"] / "1-20261021-120000.json").exists()
-    assert not (main_env["dumps"] / "run-20261021-120000.json").exists()
+    summary = json.loads((main_env["dumps"] / "run-20261021-120000.json").read_text(encoding="utf-8"))
+    assert summary[0]["group_id"] == "1" and summary[1] == {"failed": "SystemExit: sort failed"}
 
 
 def test_main_page_url_rejected_before_any_navigation(monkeypatch, main_env):
@@ -692,3 +743,67 @@ def test_main_page_url_rejected_before_any_navigation(monkeypatch, main_env):
     with pytest.raises(SystemExit) as exc:
         scraper.main()
     assert "مش رابط جروب فيسبوك" in str(exc.value)
+
+
+# ---------------------------------------------------------------- helpers added by the 2026-10-21 fixes
+
+import datetime as _dt  # noqa: E402
+
+NOW = _dt.datetime(2026, 10, 21, 16, 4)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("الأربعاء، 21 أكتوبر 2026 الساعة 3:38 م", "2026-10-21 15:38"),
+    ("الأربعاء، 21 أكتوبر 2026 الساعة 12:05 ص", "2026-10-21 00:05"),
+    ("الأربعاء، 21 أكتوبر 2026 الساعة 12:30 م", "2026-10-21 12:30"),
+    ("Wednesday, October 21, 2026 at 3:38 PM", "2026-10-21 15:38"),
+    ("21 أكتوبر 2026", "2026-10-21 00:00"),
+    ("٢٥ د", "2026-10-21 15:39"),
+    ("٤٦ دقيقة", "2026-10-21 15:18"),
+    ("٢ س", "2026-10-21 14:04"),
+    ("منذ ٤ أيام", "2026-10-17 16:04"),
+    ("3h", "2026-10-21 13:04"),
+    ("20m", "2026-10-21 15:44"),
+    ("1w", "2026-10-14 16:04"),
+    ("الآن", "2026-10-21 16:04"),
+    ("Just now", "2026-10-21 16:04"),
+    ("أمس الساعة 9:15 م", "2026-10-20 21:15"),
+    ("Yesterday at 9:15 PM", "2026-10-20 21:15"),
+])
+def test_normalize_fb_time(text, expected):
+    assert scraper.normalize_fb_time(text, NOW) == expected
+
+
+@pytest.mark.parametrize("text", ["", "   ", "not a time", "٢٥", "31 فبراير 2026"])
+def test_normalize_fb_time_unparseable_kept_as_is(text):
+    assert scraper.normalize_fb_time(text, NOW) == text.strip()
+
+
+@pytest.mark.parametrize("title, expected", [
+    ("(2) اسم الجروب _ Group ✨️📚 | Facebook", "اسم الجروب _ Group ✨️📚"),
+    ("اسم الجروب | Facebook", "اسم الجروب"),
+    ("(12) Group", "Group"),
+    ("Facebook", ""),
+    ("", ""),
+])
+def test_clean_title(title, expected):
+    assert scraper.clean_title(title) == expected
+
+
+@pytest.mark.parametrize("href, expected", [
+    (f"https://www.facebook.com/groups/{G}/posts/{P}/", P),
+    (f"https://www.facebook.com/groups/{G}/permalink/{P}/?x=1", P),
+    (f"https://www.facebook.com/groups/999/posts/{P}/", None),           # another group: notifications panel
+    (f"https://www.facebook.com/groups/{G}/user/1/", None),
+    ("", None),
+])
+def test_own_group_post_id(href, expected):
+    assert scraper.own_group_post_id(href, G) == expected
+
+
+def test_own_group_post_id_accepts_any_group_when_given_a_slug():
+    assert scraper.own_group_post_id("https://www.facebook.com/groups/123/posts/9/", "my.group") == "9"
+
+
+def test_without_token():
+    assert scraper.without_token({"token": "s", "a": 1}) == {"a": 1}

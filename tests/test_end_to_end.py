@@ -167,12 +167,13 @@ def test_reply_failures_are_dumped_with_debug(monkeypatch, world):
         {r["comment_id"]: r for r in world["sheet"].rows("Comments")}[target]["reply_status"] == ""
 
 
-def test_bad_token_is_not_detected_by_scraper(monkeypatch, world, capsys):
-    """Characterization (defect D-02) end to end: wrong token, scraper reports nothing wrong."""
+def test_bad_token_stops_the_scraper(monkeypatch, world):
+    """Fixed D-02 end to end: a wrong token used to be printed and ignored for the whole run."""
     monkeypatch.setattr(scraper, "TOKEN", "wrong-token")
-    scrape(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        scrape(monkeypatch)
+    assert "bad token" in str(exc.value)
     assert world["sheet"].state() == {}
-    assert '"ok":false' in capsys.readouterr().out.replace(" ", "")
 
 
 def test_bad_token_stops_reply_script(monkeypatch, world):

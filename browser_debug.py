@@ -109,6 +109,29 @@ PROBES: list[dict] = [
      "used_by": "visible_snapshot", "expected": "عقد النص", "tier": "critical", "page": "post"},
 
     # --- هيكل الصفحة ---
+    {"name": "post.story", "kind": "css", "selector": "[role='article']:not([aria-label])",
+     "used_by": "visible_snapshot (postRoot)",
+     "expected": "article المنشور نفسه (التعليقات ليها aria-label، هو لأ)", "tier": "critical", "page": "post"},
+    {"name": "post.own_time_link", "kind": "css", "selector": "a[href*='multi_permalinks=']",
+     "used_by": "visible_snapshot", "expected": "رابط وقت المنشور", "tier": "degraded", "page": "post",
+     "zero_ok": "created_time بيفضل فاضي بس السحب ماشي"},
+    {"name": "post.dialog_title", "kind": "css", "selector": "h2",
+     "used_by": "visible_snapshot", "expected": "«منشور فلان» — fallback لصاحب المنشور",
+     "tier": "context", "page": "post", "zero_ok": "المنشور مفتوح كصفحة مش نافذة، أو صاحبه لقيناه من رابطه"},
+    {"name": "post.photo", "kind": "css", "selector": "a[href*='/photo/'], a[href*='/photos/']",
+     "used_by": "visible_snapshot", "expected": "صورة المنشور", "tier": "context", "page": "post",
+     "zero_ok": "المنشور مفيهوش صورة"},
+    {"name": "comment.media", "kind": "css", "selector": "img[src*='scontent'], a[href*='/photo/'], video",
+     "used_by": "visible_snapshot", "expected": "صورة/ستيكر/فيديو في تعليق", "tier": "context", "page": "post",
+     "zero_ok": "مفيش ميديا"},
+    {"name": "comments.none_text", "kind": "text",
+     "selector": r"لا توجد تعليقات حتى الآن|كن أول من يعلّق|كن أول من يعلق|No comments yet|Be the first to comment",
+     "used_by": "no_comments_shown / sort_comments_newest",
+     "expected": "إثبات إن المنشور مفيهوش تعليقات (فمفيش زرار فرز)", "tier": "context", "page": "post",
+     "zero_ok": "المنشور فيه تعليقات"},
+    {"name": "menu.open", "kind": "css", "selector": "[role='menu']",
+     "used_by": "close_open_menu", "expected": "قائمة مفتوحة (Escape بيقفلها)", "tier": "context", "page": "any",
+     "zero_ok": "مفيش قائمة مفتوحة — طبيعي"},
     {"name": "post.dialog", "kind": "css", "selector": "div[role='dialog']",
      "used_by": "visible_snapshot / expand_comments / scroll_comment_pane",
      "expected": "نافذة المنشور", "tier": "context", "page": "post",
@@ -213,6 +236,8 @@ def probe_selectors(page, page_kind: str = "auto") -> dict:
         try:
             if probe["kind"] == "css":
                 row["count"] = page.locator(probe["selector"]).count()
+            elif probe["kind"] == "text":
+                row["count"] = page.get_by_text(_re.compile(probe["selector"])).count()
             else:
                 row["count"] = page.get_by_role(
                     probe["role"], name=_re.compile(probe["selector"])).count()
@@ -449,6 +474,9 @@ class PageRecorder:
             self._cdp = self.page.context.new_cdp_session(self.page)
             self._cdp.send("Log.enable")
             self._cdp.send("Runtime.enable")
+            # من أول التسجيل، عشان عدّادات perf.json تبقى عن التشغيل كله مش من لحظة الدَمب
+            with contextlib.suppress(Exception):
+                self._cdp.send("Performance.enable")
         except Exception as exc:
             self._push(self.lifecycle, {"kind": "cdp-unavailable", "message": str(exc)})
             self._cdp = None
@@ -516,6 +544,36 @@ class PageRecorder:
             "browser_log": len(self.browser_log),
         }
 
+    def _summary(self, meta: dict, reason: str, exc: BaseException | None) -> str:
+        """ملخص بشري يتقرأ بسرعة."""
+        lines = [
+            f"# {self.label} / {reason}",
+            f"url:   {meta.get('url')}",
+            f"title: {meta.get('title')}",
+            f"saved: {meta.get('saved_at')}  (+{meta.get('elapsed_sec')}s)",
+            "",
+            "counts: " + json.dumps(meta["counts"], ensure_ascii=False),
+        ]
+        if exc is not None:
+            lines += ["", f"exception: {meta['exception']['type']}: {meta['exception']['message']}"]
+        if meta.get("selectors_zero_match"):
+            lines += ["", "selectors with zero matches (شوف selectors.txt):",
+                      "  " + ", ".join(meta["selectors_zero_match"])]
+        for key, label in (("trace", "trace"), ("har", "har")):
+            if meta.get(key):
+                lines.append(f"{label}: {meta[key]}")
+        hot = [c for c in self.console if c.get("type") == "error"][-15:]
+        if hot:
+            lines += ["", "last console errors:"] + [f"  - {c.get('text','')[:300]}" for c in hot]
+        if self.errors:
+            lines += ["", "page errors:"] + [f"  - {e.get('kind')}: {str(e.get('message'))[:300]}" for e in self.errors[-15:]]
+        if self.network:
+            lines += ["", "network problems:"] + [
+                f"  - {n.get('status') or n.get('failure')} {n.get('method','')} {str(n.get('url'))[:160]}"
+                for n in self.network[-20:]
+            ]
+        return "\n".join(lines) + "\n"
+
     def dump(self, reason: str = "dump", exc: BaseException | None = None) -> Path:
         """يحفظ كل حاجة في فولدر واحد ويرجّع مساره. مابيرفعش استثناء أبدًا."""
         out = DEBUG_DIR / f"{_stamp()}-{_safe(self.label)}-{_safe(reason)}"
@@ -548,6 +606,19 @@ class PageRecorder:
         except Exception:
             pass
 
+        def write_logs() -> None:
+            _write_jsonl(out / "console.jsonl", self.console)
+            _write_jsonl(out / "errors.jsonl", self.errors)
+            _write_jsonl(out / "network.jsonl", self.network)
+            _write_jsonl(out / "browser-log.jsonl", self.browser_log)
+            _write_jsonl(out / "lifecycle.jsonl", self.lifecycle)
+            (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            (out / "summary.txt").write_text(self._summary(meta, reason, exc), encoding="utf-8")
+
+        # الرخيص والمهم الأول: لو العملية اتقتلت وسط الـ trace (ممكن ياخد دقيقة)، دول يفضلوا
+        with contextlib.suppress(Exception):
+            write_logs()
+
         # HTML
         try:
             (out / "page.html").write_text(self.page.content(), encoding="utf-8", errors="replace")
@@ -563,6 +634,9 @@ class PageRecorder:
 
         # الصورة: full page الأول، وبعدين viewport
         shot = out / "page.png"
+        # تاب في الخلفية مابيرسمش، والصورة بتستنى لحد الـ timeout (اتشاف على المتصفح الحقيقي)
+        with contextlib.suppress(Exception):
+            self.page.bring_to_front()
         try:
             self.page.screenshot(path=str(shot), full_page=True, timeout=20000)
             meta["screenshot"] = "full_page"
@@ -612,10 +686,13 @@ class PageRecorder:
 
         # عدّادات الأداء من CDP: بتبيّن لو الصفحة تقيلة أو فيها تسريب ذاكرة
         try:
-            session = self.page.context.new_cdp_session(self.page)
-            session.send("Performance.enable")
-            metrics = session.send("Performance.getMetrics")
-            session.detach()
+            if self._cdp is not None:
+                metrics = self._cdp.send("Performance.getMetrics")
+            else:
+                session = self.page.context.new_cdp_session(self.page)
+                session.send("Performance.enable")
+                metrics = session.send("Performance.getMetrics")
+                session.detach()
             flat = {m["name"]: m["value"] for m in metrics.get("metrics", [])}
             (out / "perf.json").write_text(json.dumps(flat, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -643,41 +720,7 @@ class PageRecorder:
             except Exception as e:
                 meta["har_error"] = str(e)[:300]
 
-        _write_jsonl(out / "console.jsonl", self.console)
-        _write_jsonl(out / "errors.jsonl", self.errors)
-        _write_jsonl(out / "network.jsonl", self.network)
-        _write_jsonl(out / "browser-log.jsonl", self.browser_log)
-        _write_jsonl(out / "lifecycle.jsonl", self.lifecycle)
-        (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        # ملخص بشري يتقرأ بسرعة
-        lines = [
-            f"# {self.label} / {reason}",
-            f"url:   {meta.get('url')}",
-            f"title: {meta.get('title')}",
-            f"saved: {meta.get('saved_at')}  (+{meta.get('elapsed_sec')}s)",
-            "",
-            "counts: " + json.dumps(meta["counts"], ensure_ascii=False),
-        ]
-        if exc is not None:
-            lines += ["", f"exception: {meta['exception']['type']}: {meta['exception']['message']}"]
-        if meta.get("selectors_zero_match"):
-            lines += ["", "selectors with zero matches (شوف selectors.txt):",
-                      "  " + ", ".join(meta["selectors_zero_match"])]
-        for key, label in (("trace", "trace"), ("har", "har")):
-            if meta.get(key):
-                lines.append(f"{label}: {meta[key]}")
-        hot = [c for c in self.console if c.get("type") == "error"][-15:]
-        if hot:
-            lines += ["", "last console errors:"] + [f"  - {c.get('text','')[:300]}" for c in hot]
-        if self.errors:
-            lines += ["", "page errors:"] + [f"  - {e.get('kind')}: {str(e.get('message'))[:300]}" for e in self.errors[-15:]]
-        if self.network:
-            lines += ["", "network problems:"] + [
-                f"  - {n.get('status') or n.get('failure')} {n.get('method','')} {str(n.get('url'))[:160]}"
-                for n in self.network[-20:]
-            ]
-        (out / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_logs()
 
         self.dumps.append(out)
         print(f"[debug] saved {out}", file=sys.stderr)
@@ -875,6 +918,11 @@ def cmd_watch(args) -> int:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(
         description="تشخيص المتصفح: HTML وكونسول وأخطاء وشبكة وصور",
         formatter_class=argparse.RawDescriptionHelpFormatter,

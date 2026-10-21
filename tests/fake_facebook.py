@@ -62,6 +62,7 @@ class Post:
     external_url: str | None = None
     video_src: str | None = None
     escape_closes: bool = False           # live 2026-10-21: Escape closes the post dialog -> facebook.com/
+    no_comments_text: bool = True         # Facebook writes «لا توجد تعليقات حتى الآن» when there are none
 
 
 @dataclass
@@ -70,6 +71,8 @@ class Group:
     post_ids: list[str] = field(default_factory=list)
     page_size: int = 3                    # post cards revealed per scroll
     extra_links: list[str] = field(default_factory=list)
+    # live 2026-10-21: the hidden Notifications panel (banner > dialog) holds other groups' post links
+    notification_links: list[str] = field(default_factory=list)
     sort_label: str = "فرز موجز المجموعة: المنشورات الجديدة"
 
 
@@ -191,6 +194,7 @@ function render() {
     }
   }
   host.append(list);
+  if (!D.comments.length && D.no_comments_text) host.append(el('h3', {}, EN ? 'No comments yet' : 'لا توجد تعليقات حتى الآن'));
   if (shown < all.length) host.append(el('div', {role: 'button', 'data-action': 'more'}, T.more));
   if (D.composer === 'bottom') host.append(composer('post'));
   host.append(el('div', {class: 'spacer'}));
@@ -252,6 +256,18 @@ _FEED_JS = r"""
 (() => {
 const D = window.__DATA;
 let shown = D.page_size;
+if (D.notification_links.length) {
+  const banner = document.body.appendChild(document.createElement('div'));
+  banner.setAttribute('role', 'banner');
+  const panel = banner.appendChild(document.createElement('div'));
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'الإشعارات');
+  panel.style.cssText = 'width: 0; overflow: hidden;';
+  for (const href of D.notification_links) {
+    const a = panel.appendChild(document.createElement('a'));
+    a.href = href; a.textContent = 'notification';
+  }
+}
 const main = document.body.appendChild(document.createElement('div'));
 main.setAttribute('role', 'main');
 function render() {

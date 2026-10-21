@@ -17,9 +17,11 @@ r"""
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -35,8 +37,14 @@ DUMP_DIR = Path(r"D:\Hermes Browser\dumps")
 
 GROUP_RE = re.compile(r"facebook\.com/groups/([^/?#]+)", re.I)
 POST_RE = re.compile(r"/groups/[^/]+/(?:posts|permalink)/(\d+)")
-CID_RE = re.compile(r"comment_id=(\d+)")
-RCID_RE = re.compile(r"reply_comment_id=(\d+)")
+# نفس POST_RE بس بيرجّع الجروب كمان، عشان نرفض منشورات الجروبات التانية
+POST_GROUP_RE = re.compile(r"/groups/([^/?#]+)/(?:posts|permalink)/(\d+)")
+# متربوطين بحدود الباراميتر: من غيرها comment_id= كانت بتلقط جوه reply_comment_id=
+CID_RE = re.compile(r"[?&]comment_id=(\d+)")
+RCID_RE = re.compile(r"[?&]reply_comment_id=(\d+)")
+# فيسبوك مابيحطش زرار فرز خالص لو المنشور مفيهوش تعليقات، وبيكتب ده بدله
+NO_COMMENTS_RE = re.compile(r"لا توجد تعليقات حتى الآن|كن أول من يعلّق|كن أول من يعلق|No comments yet|Be the first to comment")
+NO_COMMENTS_JS = NO_COMMENTS_RE.pattern
 EXPAND_RE = re.compile(
     r"(عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|"
     r"عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|"
@@ -52,6 +60,82 @@ def group_key(url: str) -> str:
     if not match:
         raise SystemExit(f"مش رابط جروب فيسبوك: {url}")
     return match.group(1)
+
+
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_MONTHS = {
+    "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4, "مايو": 5, "يونيو": 6, "يوليو": 7,
+    "أغسطس": 8, "اغسطس": 8, "سبتمبر": 9, "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11, "ديسمبر": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7,
+    "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+# الوحدة -> دقايق. فيسبوك بيكتب «٢٥ د» و «٢ س» و «3h» و «منذ ٤ أيام»
+_UNITS = [
+    (r"(?:د|دقيقة|دقائق|دقيقتين|m|min|mins|minutes?)", 1),
+    (r"(?:س|ساعة|ساعات|ساعتين|h|hr|hrs|hours?)", 60),
+    (r"(?:ي|يوم|أيام|ايام|يومين|d|days?)", 60 * 24),
+    (r"(?:أ|أسبوع|أسابيع|اسبوع|w|wk|weeks?)", 60 * 24 * 7),
+]
+
+
+def normalize_fb_time(text: str, now: dt.datetime | None = None) -> str:
+    """وقت فيسبوك -> «YYYY-MM-DD HH:MM». لو مش مفهوم بيرجع النص زي ما هو.
+
+    بيفهم: «الأربعاء، 21 أكتوبر 2026 الساعة 3:38 م» و «Wednesday, October 21, 2026 at 3:38 PM»
+    والنسبي: «٢٥ د» و «منذ ٢ ساعة» و «3h» و «الآن» / «Just now» (محسوب من وقت السحب).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    now = now or dt.datetime.now()
+    s = raw.translate(_AR_DIGITS).replace("،", ",").replace("منذ", "").strip()
+    low = s.lower()
+
+    m = re.search(r"(\d{1,2})\s+([^\s\d,]+)\s+(\d{4})", s) or re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", s)
+    if m:
+        a, b, year = m.groups()
+        day, month = (int(a), _MONTHS.get(b.lower())) if a.isdigit() else (int(b), _MONTHS.get(a.lower()))
+        clock = re.search(r"(\d{1,2}):(\d{2})\s*(م|ص|pm|am)?", low)
+        if month:
+            hour, minute = (int(clock.group(1)), int(clock.group(2))) if clock else (0, 0)
+            ampm = clock.group(3) if clock else None
+            if ampm in ("م", "pm") and hour < 12:
+                hour += 12
+            if ampm in ("ص", "am") and hour == 12:
+                hour = 0
+            try:
+                return dt.datetime(int(year), month, day, hour, minute).strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                return raw
+
+    if low in ("الآن", "just now", "now") or low.startswith("الآن"):
+        return now.strftime("%Y-%m-%d %H:%M")
+    if low.startswith(("أمس", "امس", "yesterday")):
+        clock = re.search(r"(\d{1,2}):(\d{2})\s*(م|ص|pm|am)?", low)
+        day = now - dt.timedelta(days=1)
+        if clock:
+            hour = int(clock.group(1)) % 12 + (12 if clock.group(3) in ("م", "pm") else 0)
+            day = day.replace(hour=hour, minute=int(clock.group(2)))
+        return day.strftime("%Y-%m-%d %H:%M")
+    compact = re.sub(r"\s+", "", low)
+    for unit, minutes in _UNITS:
+        m = re.fullmatch(rf"(\d+){unit}", compact)
+        if m:
+            return (now - dt.timedelta(minutes=int(m.group(1)) * minutes)).strftime("%Y-%m-%d %H:%M")
+    return raw
+
+
+def clean_title(title: str) -> str:
+    """«(2) اسم الجروب | Facebook» -> «اسم الجروب». الـ (2) عدد الإشعارات مش جزء من الاسم."""
+    parts = [p.strip() for p in (title or "").split("|")]
+    parts = [p for p in parts if p and p != "Facebook"]
+    name = parts[0] if parts else ""
+    return re.sub(r"^\(\d+\)\s*", "", name).strip()
+
+
+def without_token(payload: dict) -> dict:
+    """نسخة للحفظ على الديسك: التوكن مالوش لازمة في الدَمب."""
+    return {k: v for k, v in payload.items() if k != "token"}
 
 
 def sheet_comment(comment: dict, post_content: str = "") -> dict:
@@ -81,7 +165,7 @@ def sheet_post_payload(group_id: str, post: dict, comments: list[dict]) -> dict:
             "post_id": post.get("post_id"),
             "author": post.get("author") or "",
             "author_id": post.get("author_id") or "",
-            "text": post.get("post_content") or post.get("text") or "",
+            "text": post.get("text") or post.get("post_content") or "",
             "post content": post.get("post_content") or post.get("text") or "",
             "created_time": post.get("created_time") or "",
             "url": post.get("url") or post.get("permalink") or "",
@@ -102,23 +186,55 @@ def sheet_post(payload: dict) -> str:
     )
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
-            return resp.read().decode("utf-8", "replace")
+            answer = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         raise SystemExit(f"الشيت رفض الإرسال HTTP {exc.code}: {detail[:500]}") from exc
+    # Apps Script بيرجّع 200 حتى لو رفض (توكن غلط، خطأ في السكربت، صفحة خطأ HTML)
+    try:
+        parsed = json.loads(answer)
+    except ValueError:
+        raise SystemExit(f"رد الشيت مش JSON — غالبًا صفحة خطأ من Apps Script: {answer[:300]}") from None
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        raise SystemExit(f"الشيت رفض البيانات: {answer[:300]}")
+    return answer
 
 
-def collect_post_ids(page, group_id: str, max_posts: int) -> list[str]:
+def own_group_post_id(href: str, group_id: str) -> str | None:
+    """رقم المنشور لو الرابط لمنشور في الجروب ده بالذات، غير كده None.
+
+    الإشعارات والاقتراحات بتعرض منشورات جروبات تانية على نفس الصفحة. لو الجروب
+    متدّي باسم (slug) مش رقم، مانقدرش نقارن، فبنقبل أي جروب.
+    """
+    match = POST_GROUP_RE.search(href or "")
+    if not match:
+        return None
+    if group_id.isdigit() and match.group(1) != group_id:
+        return None
+    return match.group(2)
+
+
+# روابط المنشورات من الموجز بس: مش من نافذة الإشعارات (banner) ولا أي dialog ولا الشريط الجانبي
+FEED_LINKS_JS = """() => {
+  const scope = document.querySelector("div[role='main']") || document.body;
+  return [...scope.querySelectorAll("a[href*='/posts/'], a[href*='/permalink/']")]
+    .filter(a => !a.closest("[role='dialog'], [role='banner'], [role='complementary']"))
+    .map(a => a.href);
+}"""
+
+
+def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
     page.goto(
         f"https://www.facebook.com/groups/{group_id}?sorting_setting=CHRONOLOGICAL",
         wait_until="domcontentloaded",
         timeout=60000,
     )
     page.wait_for_timeout(4000)
+    # textContent مش innerText: innerText بيجبر layout على كل زرار، وده أخد 18 ثانية على فيسبوك
     label = page.evaluate(
         """() => {
           const t = [...document.querySelectorAll('[role="button"]')]
-            .map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
+            .map(e => (e.textContent || '').replace(/\\s+/g, ' ').trim())
             .find(x => x.includes('فرز موجز المجموعة'));
           return t || '';
         }"""
@@ -126,15 +242,12 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> list[str]:
     ids: list[str] = []
     stale = 0
     while len(ids) < max_posts and stale < 6:
-        hrefs = page.eval_on_selector_all(
-            "a[href*='/posts/'], a[href*='/permalink/']",
-            "els => els.map(e => e.href)",
-        )
+        hrefs = page.evaluate(FEED_LINKS_JS)
         before = len(ids)
         for href in hrefs:
-            match = POST_RE.search(href or "")
-            if match and match.group(1) not in ids:
-                ids.append(match.group(1))
+            post_id = own_group_post_id(href, group_id)
+            if post_id and post_id not in ids:
+                ids.append(post_id)
                 if len(ids) >= max_posts:
                     break
         stale = stale + 1 if len(ids) == before else 0
@@ -145,8 +258,47 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> list[str]:
     return ids[:max_posts], label
 
 
+# جذر المنشور المفتوح: أعرض dialog فيه منشور (article من غير aria-label)، وإلا role=main.
+# مش «أول dialog»: نافذة الإشعارات dialog مخفي بيبقى أول واحد في الصفحة.
+POST_ROOT_JS = r"""
+  const postRoot = () => {
+    const dialogs = [...document.querySelectorAll("div[role='dialog']")]
+      .filter(d => d.querySelector("[role='article']:not([aria-label])"));
+    return dialogs.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0]
+      || document.querySelector("div[role='main']") || document.body;
+  };
+"""
+
+
+# حالات فرز مقبولة: «الأحدث»، أو مفيش تعليقات خالص (الترتيب مالوش معنى)
+SORT_OK = ("الأحدث", "no-comments")
+
+
+def no_comments_shown(page) -> bool:
+    """فيسبوك كاتب «لا توجد تعليقات حتى الآن» ومفيش ولا تعليق ظاهر."""
+    return bool(page.evaluate(
+        "(pattern) => {" + POST_ROOT_JS + """
+          const root = postRoot();
+          if (root.querySelectorAll("div[role='article'][aria-label]").length) return false;
+          return new RegExp(pattern).test(root.textContent || '');
+        }""",
+        NO_COMMENTS_JS,
+    ))
+
+
+def close_open_menu(page) -> None:
+    """Escape بس لو في قائمة مفتوحة. Escape من غير قائمة بيقفل نافذة المنشور نفسها
+    وفيسبوك بيرجع للصفحة الرئيسية."""
+    if page.locator("[role='menu']").count():
+        page.keyboard.press("Escape")
+
+
 def sort_comments_newest(page) -> str:
-    """يفتح قائمة فرز التعليقات ويختار «الأحدث». الضغط لازم يكون حقيقي مش JavaScript."""
+    """يفتح قائمة فرز التعليقات ويختار «الأحدث». الضغط لازم يكون حقيقي مش JavaScript.
+
+    بيرجّع «الأحدث»، أو «no-comments» لو المنشور مفيهوش تعليقات خالص (مفيش زرار فرز
+    أصلًا والترتيب مالوش معنى)، أو سبب الفشل.
+    """
     page.wait_for_timeout(1500)
     name = re.compile(r"الأحدث|Newest")
     opener_name = re.compile(r"الأكثر ملاءمة|كل التعليقات|Most relevant|All comments")
@@ -155,10 +307,12 @@ def sort_comments_newest(page) -> str:
             return "الأحدث"
         if page.get_by_role("button", name=opener_name).count():
             break
+        if no_comments_shown(page):
+            return "no-comments"
         page.wait_for_timeout(700)
     opener = page.get_by_role("button", name=opener_name)
     if not opener.count():
-        return "missing"
+        return "no-comments" if no_comments_shown(page) else "missing"
     try:
         target = opener.last
         target.scroll_into_view_if_needed(timeout=4000)
@@ -170,7 +324,7 @@ def sort_comments_newest(page) -> str:
     if not option.count():
         option = page.get_by_text(re.compile(r"^الأحدث"))
     if not option.count():
-        page.keyboard.press("Escape")
+        close_open_menu(page)
         return "no-option"
     option.first.click(timeout=5000)
     page.wait_for_timeout(2000)
@@ -183,8 +337,8 @@ def expand_comments(page, rounds: int = 30) -> None:
     """يفتح كل التعليقات وكل أشجار الردود. لا يضغط زر «رد» نفسه."""
     for _ in range(rounds):
         clicked = page.evaluate(
-            r"""() => {
-              const root = document.querySelector("div[role='dialog']") || document.body;
+            r"""() => {""" + POST_ROOT_JS + r"""
+              const root = postRoot();
               const wanted = /عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|View more comments|View previous comments|View more replies|View all \d+ replies|View \d+ repl/;
               const buttons = [...root.querySelectorAll('[role="button"]')].filter(e => {
                 const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
@@ -203,8 +357,8 @@ def expand_comments(page, rounds: int = 30) -> None:
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(700)
             clicked = page.evaluate(
-                r"""() => {
-                  const root = document.querySelector("div[role='dialog']") || document.body;
+                r"""() => {""" + POST_ROOT_JS + r"""
+                  const root = postRoot();
                   const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|View more comments|View .*repl/;
                   return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.innerText || '').replace(/\s+/g, ' ').trim()));
                 }"""
@@ -216,68 +370,92 @@ def expand_comments(page, rounds: int = 30) -> None:
 
 
 def visible_snapshot(page, group_id: str, post_id: str) -> dict:
+    """يقرأ المنشور المفتوح والتعليقات الظاهرة دلوقتي.
+
+    كل حاجة متقيّدة بـ article المنشور نفسه جوه جذره (postRoot): فيسبوك بيعرض الموجز
+    وراء نافذة المنشور، وأول data-ad-preview أو أول h2 في الصفحة ممكن يبقوا لمنشور تاني.
+    """
     return page.evaluate(
-        r"""(ids) => {
+        r"""(ids) => {""" + POST_ROOT_JS + r"""
           const postId = ids.postId;
+          const groupId = ids.groupId;
           const clean = (href) => {
             if (!href) return '';
             try {
-              const u = new URL(href);
-              ['__cft__', '__tn__', 'fbclid'].forEach(k => u.searchParams.delete(k));
+              const u = new URL(href, location.href);
+              // __cft__[0] و __tn__ و fbclid: توكنات تتبّع بتتغيّر مع كل تحميل
+              [...u.searchParams.keys()].filter(k => k.startsWith('__') || k === 'fbclid')
+                .forEach(k => u.searchParams.delete(k));
               u.hash = '';
               return u.toString();
-            } catch (e) { return href.split('&__cft__')[0]; }
+            } catch (e) { return href.split(/[?&]__cft__/)[0]; }
           };
           const userIdFrom = (href) => {
             const m = (href || '').match(/\/user\/(\d+)|[?&]id=(\d+)/);
             return m ? (m[1] || m[2]) : '';
           };
-          const dialogs = [...document.querySelectorAll("div[role='dialog']")];
-          const root = dialogs.sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0]
-            || document.querySelector("div[role='main']") || document.body;
-          const msg = document.querySelector("div[data-ad-preview='message'], div[data-ad-comet-preview='message']");
-          const header = root.querySelector("h2 a[href*='/user/'], h3 a[href*='/user/'], strong a[href*='/user/']")
-            || root.querySelector("h2 a, h3 a");
-          const timeLink = root.querySelector(`a[href*='/posts/${postId}']`);
+          const named = a => (a.innerText || '').trim();
+          const root = postRoot();
+          const ownLink = `a[href*='multi_permalinks=${postId}'], a[href*='/posts/${postId}']:not([href*='comment_id='])`;
+          const stories = [...root.querySelectorAll("[role='article']:not([aria-label])")];
+          const story = stories.find(a => a.querySelector(ownLink)) || stories[0] || null;
+          const scope = story || root;
+
           const comments = [];
           root.querySelectorAll("div[role='article'][aria-label]").forEach(article => {
             const rawLink = [...article.querySelectorAll("a[href*='comment_id=']")].map(x => x.href)[0] || '';
-            const authorLink = [...article.querySelectorAll("a[href*='/user/']")].find(a => (a.innerText || '').trim()) || null;
+            const authorLink = [...article.querySelectorAll("a[href*='/user/']")].find(named) || null;
             const text = [...article.querySelectorAll("div[dir='auto']")].map(d => d.innerText.trim()).filter(Boolean).join('\n');
             const timeNode = article.querySelector("a[href*='comment_id=']");
+            // aria-label بتاع رابط الوقت فيه الوقت الكامل («21 أكتوبر 2026 الساعة 3:38 م»)، والنص نسبي («٢٥ د»)
+            const timeAria = timeNode ? (timeNode.getAttribute('aria-label') || '') : '';
             comments.push({
               link: clean(rawLink),
-              author: authorLink ? authorLink.innerText.trim() : '',
+              author: authorLink ? named(authorLink) : '',
               author_id: userIdFrom(authorLink ? authorLink.href : ''),
               author_url: authorLink ? clean(authorLink.href) : '',
               text,
-              created_time: timeNode ? (timeNode.innerText || '').trim() : '',
+              has_media: !!article.querySelector("img[src*='scontent'], a[href*='/photo/'], video"),
+              created_time: /[0-9٠-٩]{4}/.test(timeAria) ? timeAria : (timeNode ? (timeNode.innerText || '').trim() : ''),
               aria_label: article.getAttribute('aria-label') || ''
             });
           });
-          const story = [...document.querySelectorAll("[role='article']")].find(a => !a.getAttribute('aria-label') && a.querySelector(`a[href*='/posts/${postId}']`));
+
+          // صاحب المنشور: أول رابط /user/ عليه اسم جوه المنشور. مش أول h2: ده اسم الجروب
+          let authorLink = story ? [...story.querySelectorAll("a[href*='/user/']")].find(named) : null;
+          let author = authorLink ? named(authorLink) : '';
+          if (!author) {
+            // عنوان النافذة «منشور ‏فلان‏» / «Someone's post» — اسم من غير id
+            const h = ((root.querySelector('h2') || {}).innerText || '').replace(/[\u200e\u200f\u202a-\u202e]/g, '').trim();
+            const m = h.match(/^منشور\s+(.+)$/) || h.match(/^(.+)'s post$/i);
+            author = m ? m[1].trim() : '';
+          }
+          const timeLink = scope.querySelector(`a[href*='multi_permalinks=${postId}']`)
+            || scope.querySelector(`a[href*='/posts/${postId}']:not([href*='comment_id='])`);
+
+          const msg = scope.querySelector("div[data-ad-preview='message'], div[data-ad-comet-preview='message']");
           const titleParts = (document.title || '').split('|').map(s => s.trim()).filter(s => s && s !== 'Facebook');
           const titleText = titleParts.length >= 2 ? titleParts[titleParts.length - 1] : '';
-          let postContent = msg ? msg.innerText.trim() : '';
-          let contentKind = postContent ? 'text' : '';
-          if (!postContent && titleText) {
-            postContent = titleText;
-            contentKind = 'text';
-          }
-          const scope = story || root;
+          const text = msg ? msg.innerText.trim() : titleText;
+
           const external = [...scope.querySelectorAll("a[href*='l.facebook.com/l.php']")].map(a => {
-            try { return decodeURIComponent(new URL(a.href).searchParams.get('u') || ''); } catch (e) { return ''; }
-          }).find(u => u && !/facebook\\.com|fbcdn|meta\\.ai/.test(u)) || '';
-          const video = [...scope.querySelectorAll('video')].map(v => v.currentSrc || v.src).find(Boolean) || '';
-          if (video) { postContent = video; contentKind = 'video'; }
-          else if (external) { postContent = external; contentKind = 'link'; }
+            try { return clean(decodeURIComponent(new URL(a.href).searchParams.get('u') || '')); } catch (e) { return ''; }
+          }).find(u => u && !/facebook\.com|fbcdn|meta\.ai/.test(u)) || '';
+          const videos = [...scope.querySelectorAll('video')];
+          // src الفيديو غالبًا blob: مالوش قيمة برّه الصفحة، فبنعلّم النوع بس
+          const videoUrl = videos.map(v => v.currentSrc || v.src).find(u => /^https?:/.test(u || '')) || '';
+          const photo = [...scope.querySelectorAll("a[href*='/photo/'], a[href*='/photos/']")].map(a => clean(a.href))[0] || '';
+          const kind = videos.length ? 'video' : external ? 'link' : photo ? 'photo' : (text ? 'text' : '');
           return {
-            text: postContent,
-            post_content: postContent,
-            content_kind: contentKind,
-            author: header ? header.innerText.trim() : '',
-            author_id: userIdFrom(header ? header.href : ''),
-            author_url: header ? clean(header.href) : '',
+            text,
+            // «post content» في الشيت: الرابط/الميديا لو موجودة، وإلا النص — زي ما كان
+            post_content: videoUrl || external || photo || text,
+            content_kind: kind,
+            media_url: videoUrl || external || photo,
+            story_found: !!story,
+            author,
+            author_id: userIdFrom(authorLink ? authorLink.href : ''),
+            author_url: authorLink ? clean(authorLink.href) : '',
             created_time: timeLink ? (timeLink.getAttribute('aria-label') || timeLink.innerText || '').trim() : '',
             comments
           };
@@ -311,7 +489,9 @@ def normalize_comment(raw: dict, group_id: str, post_id: str) -> dict | None:
         "author_id": raw.get("author_id") or "",
         "author_url": raw.get("author_url") or "",
         "text": (raw.get("text") or "").strip(),
-        "created_time": (raw.get("created_time") or "").strip(),
+        "created_time": normalize_fb_time(raw.get("created_time") or ""),
+        "created_time_raw": (raw.get("created_time") or "").strip(),
+        "has_media": bool(raw.get("has_media")),
         "aria_label": raw.get("aria_label") or "",
         "permalink": permalink,
     }
@@ -319,8 +499,8 @@ def normalize_comment(raw: dict, group_id: str, post_id: str) -> dict | None:
 
 def scroll_comment_pane(page) -> None:
     page.evaluate(
-        r"""() => {
-          const root = document.querySelector("div[role='dialog']") || document.body;
+        r"""() => {""" + POST_ROOT_JS + r"""
+          const root = postRoot();
           const nodes = [root, ...root.querySelectorAll('div')];
           let best = null;
           let room = 0;
@@ -344,16 +524,17 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     page.wait_for_timeout(2500)
     sort_state = "missing"
     for _ in range(3):
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(400)
+        close_open_menu(page)
         try:
             sort_state = sort_comments_newest(page)
         except Exception as exc:
             sort_state = f"error:{exc}"
-        if sort_state == "الأحدث":
+        if sort_state in SORT_OK:
             break
         page.wait_for_timeout(1200)
-    if sort_state != "الأحدث":
+    if f"/posts/{post_id}" not in (page.url or ""):
+        raise SystemExit(f"فيسبوك نقل الصفحة بعيد عن المنشور {post_id}: {page.url}")
+    if sort_state not in SORT_OK:
         raise SystemExit(f"فرز التعليقات مش «الأحدث» على المنشور {post_id}: {sort_state}")
     seen: dict[str, dict] = {}
     order: list[str] = []
@@ -363,14 +544,16 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     header = {}
     # فيسبوك بيمسح التعليقات القديمة من الصفحة لما العدد يبقى بالآلاف،
     # فلازم نلتقط الظاهر قبل التمرير، ونفتح الردود، لحد ما مفيش جديد.
-    for _ in range(400):
+    # من غير تعليقات: لقطة واحدة للهيدر وخلاص، بدل 5 لفّات تمرير فاضية
+    for _ in range(1 if sort_state == "no-comments" else 400):
         if len(order) >= max_comments:
             break
         snap = visible_snapshot(page, group_id, post_id)
-        if snap.get("post_content"):
+        if snap.get("post_content") and not header.get("post_content"):
             header["post_content"] = snap["post_content"]
             header["content_kind"] = snap.get("content_kind") or ""
-            header["text"] = snap["post_content"]
+            header["text"] = snap.get("text") or ""
+            header["media_url"] = snap.get("media_url") or ""
         if snap.get("author"):
             header["author"] = snap.get("author") or header.get("author") or ""
             header["author_id"] = snap.get("author_id") or header.get("author_id") or ""
@@ -393,6 +576,8 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             del pending[:batch_size]
             batch_index += 1
             on_batch(batch, batch_index, False)
+        if sort_state == "no-comments":
+            break
         expand_comments(page, rounds=1)
         if added:
             stale = 0
@@ -414,10 +599,12 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
         "author": (header.get("author") or "").strip(),
         "author_id": header.get("author_id") or "",
         "author_url": header.get("author_url") or "",
-        "text": (header.get("post_content") or header.get("text") or "").strip(),
+        "text": (header.get("text") or "").strip(),
         "post_content": (header.get("post_content") or header.get("text") or "").strip(),
         "content_kind": header.get("content_kind") or "",
-        "created_time": (header.get("created_time") or "").strip(),
+        "media_url": header.get("media_url") or "",
+        "created_time": normalize_fb_time(header.get("created_time") or ""),
+        "created_time_raw": (header.get("created_time") or "").strip(),
         "url": url,
         "comment_sort": sort_state,
         "comments_found": len(comments),
@@ -433,6 +620,12 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
 def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: int, max_comments: int, dry: bool = True, batch_size: int = 80) -> dict:
     group_id = group_key(url)
     post_ids, feed_sort = collect_post_ids(page, group_id, max_posts)
+    # اسم الجروب من صفحة الموجز نفسها، قبل ما نفتح أي منشور
+    name = ""
+    try:
+        name = clean_title(page.title())
+    except Exception:
+        name = ""
     posts = []
     for post_id in post_ids:
         def on_batch(comments, batch_index, done):
@@ -474,11 +667,6 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
                 post["sheet_batches"] = index
         posts.append(post)
         time.sleep(1.5)
-    name = ""
-    try:
-        name = page.title().split("|")[0].strip()
-    except Exception:
-        name = ""
     return {
         "token": TOKEN,
         "group_id": group_id,
@@ -518,10 +706,22 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("min-posts لازم يكون 1 أو أكتر، وmax-posts أكبر منه أو يساويه")
     if args.min_comments < 0 or args.max_comments < args.min_comments:
         raise SystemExit("min-comments مش سالب، وmax-comments أكبر منه أو يساويه")
+    if args.batch_size < 1:
+        raise SystemExit("batch-size لازم يكون 1 أو أكتر")
     return args
 
 
+def utf8_console() -> None:
+    """الطباعة بالعربي بتوقع السكربت لو الـ stdout متحوّل لملف أو Task Scheduler (cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main() -> None:
+    utf8_console()
     args = parse_args()
     from playwright.sync_api import sync_playwright
 
@@ -551,15 +751,19 @@ def main() -> None:
                     dry=args.dry,
                     batch_size=args.batch_size,
                 )
-                results.append(payload)
+                results.append(without_token(payload))
                 out = DUMP_DIR / f"{payload['group_id']}-{stamp}.json"
-                out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                out.write_text(json.dumps(without_token(payload), ensure_ascii=False, indent=2), encoding="utf-8")
                 print("saved", out)
                 if not args.dry and not any(p.get("sheet_batches") for p in payload["posts"]):
                     answer = sheet_post(payload)
                     print("sheet:", answer[:400])
+            # من غير ده، --trace في تشغيل ناجح بيرمي التتبّع ويسيب الـ HAR لوحده
+            if recorder and args.trace:
+                recorder.dump("complete")
         except BaseException as exc:
             # SystemExit كمان: فشل فرز التعليقات بيرفعه، وده بالظبط اللي عايزين نشوف صفحته
+            results.append({"failed": f"{type(exc).__name__}: {exc}"})
             if recorder:
                 recorder.dump("failed", exc=exc)
             raise
@@ -567,9 +771,10 @@ def main() -> None:
             if recorder:
                 recorder.detach()
             page.close()
-    summary = DUMP_DIR / f"run-{stamp}.json"
-    summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("done", summary)
+            # الملخص بيتكتب حتى لو التشغيل وقع، بالجروبات اللي خلصت + سبب الوقوع
+            summary = DUMP_DIR / f"run-{stamp}.json"
+            summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("done", summary)
 
 
 if __name__ == "__main__":

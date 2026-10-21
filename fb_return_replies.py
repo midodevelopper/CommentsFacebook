@@ -7,6 +7,7 @@ r"""يرجع ردود عمود reply من الشيت إلى تعليقات في�
 import argparse
 import json
 import os
+import sys
 import urllib.parse
 import urllib.request
 
@@ -16,7 +17,7 @@ WEBAPP = (
     "https://script.google.com/macros/s/"
     "AKfycbzNQ4J6Sewu04sJaWcAJTHeQuCuQzc4At-gNl7oqXKRVTFtedHxaerG7s2-JZFGxfkUmg/exec"
 )
-TOKEN = "CommentSecrets"
+TOKEN = os.environ.get("FB_SHEET_TOKEN", "CommentSecrets")
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
 
 
@@ -46,8 +47,11 @@ def post_one(page, item: dict) -> str:
     comment_id = str(item["comment_id"])
     clicked = page.evaluate(
         """(commentId) => {
-          const link = [...document.querySelectorAll('a[href*="comment_id="]')]
-            .find(a => a.href.includes('reply_comment_id=' + commentId) || a.href.includes('comment_id=' + commentId));
+          // مطابقة الباراميتر بالظبط: href.includes('comment_id=123') كانت بتلقط 1234...
+          const params = a => { try { return new URL(a.href).searchParams; } catch (e) { return new URLSearchParams(); } };
+          const links = [...document.querySelectorAll('a[href*="comment_id="]')];
+          const link = links.find(a => params(a).get('reply_comment_id') === commentId)
+            || links.find(a => params(a).get('comment_id') === commentId && !params(a).get('reply_comment_id'));
           if (!link) return 'no-comment';
           const article = link.closest('[role="article"]') || link.parentElement;
           const button = [...article.querySelectorAll('[role="button"]')]
@@ -77,6 +81,11 @@ def main() -> None:
     parser.add_argument("--trace", action="store_true",
                         help="مع --debug: سجّل كمان trace.zip و network.har")
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     data = sheet_get("pending_replies")
     if not data.get("ok"):
@@ -108,10 +117,17 @@ def main() -> None:
                     continue
                 print(item["comment_id"], status)
                 if status == "posted":
-                    print(sheet_post({"token": TOKEN, "action": "mark_replied", "comment_ids": [item["comment_id"]]}))
+                    answer = sheet_post({"token": TOKEN, "action": "mark_replied", "comment_ids": [item["comment_id"]]})
+                    print(answer)
+                    if answer.get("ok") is not True or not answer.get("marked"):
+                        # الرد اتنشر بس الصف لسه pending: التشغيل الجاي هينشره تاني لو ماتصلّحش
+                        print(f"تحذير: {item['comment_id']} اتنشر بس ماتعلّمش posted في الشيت: {answer}",
+                              file=sys.stderr)
                 elif recorder:
                     # مانجحش من غير استثناء: no-comment / no-reply-button / missing-permalink
                     recorder.dump(f"{status}-{item['comment_id']}")
+            if recorder and args.trace:
+                recorder.dump("complete")
         finally:
             if recorder:
                 recorder.detach()

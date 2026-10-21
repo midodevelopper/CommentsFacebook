@@ -84,6 +84,12 @@ def launch(port: int) -> int:
 
 
 def main() -> int:
+    # الطباعة بالعربي بتوقع السكربت لو الـ stdout متحوّل لملف (cp1252)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(description="فتح كروميوم على البروفايل الثابت مع CDP")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     return launch(parser.parse_args().port)

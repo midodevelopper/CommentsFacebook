@@ -55,13 +55,15 @@ def test_defaults():
 @pytest.mark.unit
 def test_probes_are_well_formed():
     names = [p["name"] for p in bd.PROBES]
-    assert len(names) == len(set(names)) == 20
+    assert len(names) == len(set(names)) == 27
     for p in bd.PROBES:
-        assert p["kind"] in ("css", "role")
+        assert p["kind"] in ("css", "role", "text")
         assert p["tier"] in ("critical", "degraded", "context")
         assert p["page"] in ("post", "feed", "any")
         if p["kind"] == "role":
             assert p["role"] and re.compile(p["selector"])
+        if p["kind"] == "text":
+            assert re.compile(p["selector"])
         if p["tier"] != "critical":
             assert p.get("zero_ok") or p["tier"] == "degraded"
 
@@ -85,20 +87,15 @@ def test_core_selectors_are_in_probes():
 
 
 @pytest.mark.unit
-def test_selectors_used_in_code_but_missing_from_probes():
-    """Characterization (gap D-13): CLAUDE.md requires every selector used in code to be in PROBES.
-    These are used but not probed. When one is added to PROBES, remove it here."""
+def test_every_selector_used_in_code_is_in_probes():
+    """CLAUDE.md rule: every selector the code uses must be in PROBES (fixed gap D-13)."""
     probes = {p["selector"] for p in bd.PROBES}
     used = set()
     for name in ("fb_groups_to_sheet.py", "fb_return_replies.py"):
         used |= _js_selectors((ROOT / name).read_text(encoding="utf-8"))
     normalized = {s.replace('"', "'") for s in probes}
     absent = {s.replace('"', "'") for s in used} - normalized - {"div"}   # 'div' = generic scroll search
-    assert absent == {
-        "[role='article']",                                                  # visible_snapshot: post story
-        "h2 a, h3 a",                                                        # visible_snapshot: header fallback
-        "h2 a[href*='/user/'], h3 a[href*='/user/'], strong a[href*='/user/']",  # visible_snapshot: post author
-    }
+    assert absent == set()
 
 
 # ---------------------------------------------------------------- PageRecorder: event capture (real headless page)
@@ -416,7 +413,7 @@ def test_probe_page_kind_inference(url, kind):
     report = bd.probe_selectors(P())
     assert report["page_kind"] == kind
     assert all(r["count"] == -1 for r in report["probes"])
-    assert len(report["errors"]) == 20
+    assert len(report["errors"]) == len(bd.PROBES)
     assert "probes رمت استثناء" in bd.format_selector_report(report)
 
 
@@ -459,10 +456,63 @@ def test_successful_traced_session_without_dump_loses_trace_and_leaves_loose_har
     assert not list(debug_dir.rglob("trace.zip"))
 
 
-@pytest.mark.unit
-def test_dump_does_not_bring_page_to_front():
-    """Characterization (defect D-17): dump() screenshots without bring_to_front(); on the live
-    headed browser a background tab made both screenshot attempts time out (preflight 2026-10-21)."""
-    import inspect
+@pytest.mark.browser
+def test_dump_brings_page_to_front_before_screenshot(context, isolated_output_dirs):
+    """Fixed D-17: on the live headed browser a background tab made both screenshot attempts time out."""
+    first, second = context.new_page(), context.new_page()
+    rec = bd.PageRecorder(first, label="bg")
+    first.set_content("<p>x</p>")
+    second.bring_to_front()
+    out = rec.dump("bg")
+    assert first.evaluate("document.visibilityState") == "visible"
+    assert (out / "page.png").exists()
+    rec.detach()
+    second.close()
+    first.close()
 
-    assert "bring_to_front" not in inspect.getsource(bd.PageRecorder.dump)
+
+@pytest.mark.unit
+def test_dump_writes_logs_meta_and_summary_before_slow_artifacts(isolated_output_dirs, monkeypatch):
+    """Crash-safety (seen live: a kill during a 130 MB trace write lost meta/summary/jsonl).
+    The cheap files must exist before HTML, screenshot, trace and HAR are attempted."""
+    seen = {}
+
+    class Page:
+        url = "https://x/"
+        viewport_size = None
+
+        def title(self):
+            return "t"
+
+        def content(self):
+            out = rec_out[0]
+            seen["at_html"] = sorted(p.name for p in out.iterdir())
+            raise RuntimeError("stop here")
+
+        def __getattr__(self, name):
+            raise RuntimeError(name)
+
+    rec_out = []
+    rec = bd.PageRecorder(Page(), label="order", attach=False)
+    real_mkdir = Path.mkdir
+
+    def spy_mkdir(self, *a, **k):
+        real_mkdir(self, *a, **k)
+        if self.name.endswith("-order-x"):
+            rec_out.append(self)
+    monkeypatch.setattr(Path, "mkdir", spy_mkdir)
+    rec.dump("x")
+    assert {"console.jsonl", "errors.jsonl", "network.jsonl", "browser-log.jsonl", "lifecycle.jsonl",
+            "meta.json", "summary.txt"} <= set(seen["at_html"])
+
+
+@pytest.mark.browser
+def test_perf_counters_cover_the_session(page, isolated_output_dirs):
+    """Fixed: Performance.enable used to be called at dump time, so durations were always 0."""
+    rec = bd.PageRecorder(page, label="perf")
+    page.set_content("<div id=x></div><script>for (let i=0;i<300;i++){document.getElementById('x').append(document.createElement('p'))}</script>")
+    page.evaluate("() => { for (let i = 0; i < 50; i++) { document.body.style.width = (100 + i) + 'px'; document.body.offsetWidth; } }")
+    out = rec.dump("perf")
+    perf = json.loads((out / "perf.json").read_text(encoding="utf-8"))
+    assert perf["LayoutCount"] > 0
+    rec.detach()
