@@ -29,7 +29,7 @@ from pathlib import Path
 
 WEBAPP = (
     "https://script.google.com/macros/s/"
-    "AKfycbzNQ4J6Sewu04sJaWcAJTHeQuCuQzc4At-gNl7oqXKRVTFtedHxaerG7s2-JZFGxfkUmg/exec"
+    "AKfycbxV6e807bE6rooDlnk35nazr8QvJBruwlPo50ybCD_CMHG9WHN6kUPpFxe8m7ri8_ZqXw/exec"
 )
 TOKEN = os.environ.get("FB_SHEET_TOKEN", "CommentSecrets")
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
