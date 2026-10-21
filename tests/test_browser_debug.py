@@ -55,7 +55,7 @@ def test_defaults():
 @pytest.mark.unit
 def test_probes_are_well_formed():
     names = [p["name"] for p in bd.PROBES]
-    assert len(names) == len(set(names)) == 29
+    assert len(names) == len(set(names)) == 35
     for p in bd.PROBES:
         assert p["kind"] in ("css", "role", "text")
         assert p["tier"] in ("critical", "degraded", "context")
@@ -575,3 +575,31 @@ def test_summary_counts_noise_and_lists_only_anomalies(isolated_output_dirs):
     text = rec._summary({"url": "u", "title": "t", "saved_at": "s", "elapsed_sec": 1, "counts": rec.counts()}, "r", None)
     assert "known Facebook noise (not listed, still in the .jsonl files): 2" in text
     assert "TypeError: boom" in text and "Permissions-Policy" not in text and "page errors:" not in text
+
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", [
+    "%cانتبه! font-family:helvetica; font-size:20px;",
+    "%cStop! font-family:helvetica;",
+    "يمكنك الاطلاع على https://www.facebook.com/selfxss للحصول على مزيد من المعلومات.",
+    "net::ERR_FAILED chrome-extension://invalid/",
+])
+def test_known_noise_round3(text):
+    assert bd.is_known_noise(text) is True
+
+
+@pytest.mark.browser
+def test_har_omits_response_bodies_by_default(page, context, isolated_output_dirs):
+    """Live run 5: HAR with bodies was 140–426 MB per group. Status/timing/headers are kept."""
+    body = "<p>" + ("x" * 50000) + "</p>"
+    context.route("**/*", lambda r: r.fulfill(status=200, content_type="text/html", body=body))
+    rec = bd.PageRecorder(page, label="har", har=True)
+    page.goto("https://har.test/")
+    out = rec.dump("har")
+    har = json.loads((out / "network.har").read_text(encoding="utf-8"))
+    entry = next(e for e in har["log"]["entries"] if e["request"]["url"] == "https://har.test/")
+    assert entry["response"]["status"] == 200 and entry["time"] >= 0
+    assert "text" not in entry["response"]["content"]
+    assert (out / "network.har").stat().st_size < 50000
+    rec.detach()

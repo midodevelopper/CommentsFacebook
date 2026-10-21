@@ -80,6 +80,8 @@ ROOT = Path(__file__).resolve().parent
 DEBUG_DIR = Path(os.environ.get("FB_DEBUG_DIR", ROOT / "debug"))
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
 
+HAR_CONTENT = os.environ.get("FB_DEBUG_HAR_CONTENT", "omit")
+
 # الكونسول بيطلع رسائل بالآلاف على فيسبوك. نحد الحجم بدل ما الذاكرة تتفجّر.
 MAX_EVENTS = int(os.environ.get("FB_DEBUG_MAX_EVENTS", "5000"))
 
@@ -128,9 +130,29 @@ PROBES: list[dict] = [
     {"name": "post.shared_text", "kind": "css", "selector": "div[dir='auto'], span[dir='auto']",
      "used_by": "visible_snapshot", "expected": "نص المنشور المتشارك (مفيهوش data-ad-preview)",
      "tier": "context", "page": "post", "zero_ok": "مفيش نص"},
-    {"name": "comment.media", "kind": "css", "selector": "img[src*='scontent'], a[href*='/photo/'], video",
+    {"name": "comment.photo_link", "kind": "css", "selector": "a[href*='/photo/']",
+     "used_by": "visible_snapshot", "expected": "صورة في تعليق", "tier": "context", "page": "post",
+     "zero_ok": "مفيش صور"},
+    {"name": "comment.media", "kind": "css", "selector": "img, video",
      "used_by": "visible_snapshot", "expected": "صورة/ستيكر/فيديو في تعليق", "tier": "context", "page": "post",
      "zero_ok": "مفيش ميديا"},
+    {"name": "comments.off_text", "kind": "text",
+     "selector": r"تم إيقاف تشغيل التعليقات|تم إيقاف التعليقات|Commenting has been turned off|turned off commenting|Comments are turned off|comments have been turned off",
+     "used_by": "comments_off_shown / sort_comments_newest", "expected": "صاحب المنشور قفل التعليقات",
+     "tier": "context", "page": "post", "zero_ok": "التعليقات مفتوحة"},
+    {"name": "post.unavailable_text", "kind": "text",
+     "selector": r"هذا المحتوى غير متوفر حاليًا|هذا المحتوى غير متاح|This content isn.t available",
+     "used_by": "post_unavailable / scrape_post", "expected": "المنشور اتمسح أو اتخفى",
+     "tier": "context", "page": "post", "zero_ok": "المنشور موجود"},
+    {"name": "group.join_button", "kind": "role", "role": "button", "selector": r"انضمام إلى المجموعة|Join group",
+     "used_by": "group_is_private_for_us", "expected": "الحساب مش عضو (جروب خاص = مفيش موجز)",
+     "tier": "context", "page": "feed", "zero_ok": "الحساب عضو"},
+    {"name": "feed.container", "kind": "css", "selector": "[role='feed']",
+     "used_by": "group_is_private_for_us", "expected": "موجز الجروب", "tier": "degraded", "page": "feed",
+     "zero_ok": "جروب خاص والحساب مش عضو"},
+    {"name": "post.video_link", "kind": "css", "selector": "a[href*='/reel/'], a[href*='/videos/'], a[href*='/watch/']",
+     "used_by": "visible_snapshot", "expected": "رابط الفيديو/الريل", "tier": "context", "page": "post",
+     "zero_ok": "المنشور مش فيديو"},
     {"name": "comments.none_text", "kind": "text",
      "selector": r"لا توجد تعليقات حتى الآن|كن أول من يعلّق|كن أول من يعلق|No comments yet|Be the first to comment",
      "used_by": "no_comments_shown / sort_comments_newest",
@@ -211,6 +233,8 @@ KNOWN_NOISE = [
     r"Minified React error #418",                       # hydration mismatch جوه فيسبوك
     r"Multiple readback operations using getImageData",
     r"ERR_(ABORTED|CONNECTION_CLOSED) .*fbcdn\.net",    # ستريم فيديو اتلغى لما الصفحة اتنقلت
+    r"selfxss|^%c(انتبه!|Stop!)",                       # تحذير فيسبوك للمطورين في كل صفحة
+    r"chrome-extension://invalid",                      # فيسبوك بيدوّر على إضافات المتصفح
 ]
 _NOISE_RE = None
 
@@ -403,7 +427,9 @@ class PageRecorder:
         try:
             DEBUG_DIR.mkdir(parents=True, exist_ok=True)
             path = DEBUG_DIR / f"{_stamp()}-{_safe(self.label)}.har"
-            self.page.context.tracing.start_har(path=str(path))
+            # من غير محتوى الردود: الـ HAR كان 140–426MB للجروب (سكربتات وصور وفيديو)، والمطلوب
+            # للتشخيص الحالة والتوقيت والهيدرز بس. FB_DEBUG_HAR_CONTENT=embed يرجّع المحتوى.
+            self.page.context.tracing.start_har(path=str(path), content=HAR_CONTENT)
             self._har_path = path
         except Exception as exc:
             self._push(self.lifecycle, {"kind": "har-unavailable", "message": str(exc)[:300]})

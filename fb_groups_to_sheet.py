@@ -46,6 +46,15 @@ RCID_RE = re.compile(r"[?&]reply_comment_id=(\d+)")
 # فيسبوك مابيحطش زرار فرز خالص لو المنشور مفيهوش تعليقات، وبيكتب ده بدله
 NO_COMMENTS_RE = re.compile(r"لا توجد تعليقات حتى الآن|كن أول من يعلّق|كن أول من يعلق|No comments yet|Be the first to comment")
 NO_COMMENTS_JS = NO_COMMENTS_RE.pattern
+# صاحب المنشور قفل التعليقات: برضه مفيش زرار فرز ولا «لا توجد تعليقات» (اتشاف في تشغيل حقيقي)
+COMMENTS_OFF_RE = re.compile(r"تم إيقاف تشغيل التعليقات|تم إيقاف التعليقات|Commenting has been turned off|"
+                             r"turned off commenting|Comments are turned off|comments have been turned off")
+COMMENTS_OFF_JS = COMMENTS_OFF_RE.pattern
+# المنشور اتمسح أو اتخفى بين ما شفناه في الموجز وفتحناه (اتشاف في تشغيل حقيقي)
+UNAVAILABLE_RE = re.compile(r"هذا المحتوى غير متوفر حاليًا|هذا المحتوى غير متاح|This content isn.t available")
+# جروب خاص والحساب مش عضو: مفيش موجز خالص، بس زرار «انضمام»
+PRIVATE_RE = re.compile(r"مجموعة\s*\u200f?\s*خاصة|Private group")
+JOIN_RE = re.compile(r"انضمام إلى المجموعة|Join group")
 EXPAND_RE = re.compile(
     r"(عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|"
     r"عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|"
@@ -108,6 +117,33 @@ def normalize_fb_time(text: str, now: dt.datetime | None = None) -> str:
                 return dt.datetime(int(year), month, day, hour, minute).strftime("%Y-%m-%d %H:%M")
             except ValueError:
                 return raw
+
+    # من غير سنة: «11 أكتوبر الساعة 5:38 ص» / «October 11 at 5:38 AM» — السنة الحالية،
+    # إلا لو التاريخ كده يبقى في المستقبل (يبقى من السنة اللي فاتت)
+    found = None
+    for m in (re.search(r"(\d{1,2})\s+([^\s\d,]+)", s), re.search(r"([A-Za-z]+)\s+(\d{1,2})\b", s)):
+        if m:
+            a, b = m.groups()
+            day, month = (int(a), _MONTHS.get(b.lower())) if a.isdigit() else (int(b), _MONTHS.get(a.lower()))
+            if month:
+                found = (day, month)
+                break
+    if found:
+        day, month = found
+        clock = re.search(r"(\d{1,2}):(\d{2})\s*(م|ص|pm|am)?", low)
+        hour, minute = (int(clock.group(1)), int(clock.group(2))) if clock else (0, 0)
+        ampm = clock.group(3) if clock else None
+        if ampm in ("م", "pm") and hour < 12:
+            hour += 12
+        if ampm in ("ص", "am") and hour == 12:
+            hour = 0
+        try:
+            when = dt.datetime(now.year, month, day, hour, minute)
+            if when > now + dt.timedelta(days=1):
+                when = when.replace(year=now.year - 1)
+            return when.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return raw
 
     if low in ("الآن", "just now", "now") or low.startswith("الآن"):
         return now.strftime("%Y-%m-%d %H:%M")
@@ -260,6 +296,9 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
         timeout=60000,
     )
     page.wait_for_timeout(4000)
+    if group_is_private_for_us(page):
+        print(f"الجروب {group_id} خاص والحساب مش عضو فيه — مفيش منشورات نقدر نشوفها", file=sys.stderr)
+        return [], ""
     # textContent مش innerText: innerText بيجبر layout على كل زرار، وده أخد 18 ثانية على فيسبوك
     label = page.evaluate(
         """() => {
@@ -300,8 +339,10 @@ POST_ROOT_JS = r"""
 """
 
 
-# حالات فرز مقبولة: «الأحدث»، أو مفيش تعليقات خالص (الترتيب مالوش معنى)
-SORT_OK = ("الأحدث", "no-comments")
+# حالات فرز مقبولة: «الأحدث»، أو مفيش تعليقات خالص / التعليقات مقفولة (الترتيب مالوش معنى)
+SORT_OK = ("الأحدث", "no-comments", "comments-off")
+# حالات مفيهاش تعليقات أصلًا: لقطة الهيدر وخلاص، من غير لفّات تمرير
+NO_COMMENT_STATES = ("no-comments", "comments-off")
 
 
 def no_comments_shown(page) -> bool:
@@ -313,6 +354,37 @@ def no_comments_shown(page) -> bool:
           return new RegExp(pattern).test(root.textContent || '');
         }""",
         NO_COMMENTS_JS,
+    ))
+
+
+def page_text_matches(page, pattern: str) -> bool:
+    """نص ظاهر في جذر المنشور (مش الصفحة كلها: الموجز ورا النافذة ممكن يكون فيه نفس الكلام)."""
+    return bool(page.evaluate(
+        "(pattern) => {" + POST_ROOT_JS + "return new RegExp(pattern).test(postRoot().textContent || ''); }",
+        pattern,
+    ))
+
+
+def comments_off_shown(page) -> bool:
+    return page_text_matches(page, COMMENTS_OFF_JS)
+
+
+def post_unavailable(page) -> bool:
+    """«هذا المحتوى غير متوفر حاليًا»: المنشور اتمسح أو اتخفى."""
+    return bool(page.evaluate(
+        "(p) => { const b = document.body; return new RegExp(p).test(b ? (b.innerText || b.textContent || '') : ''); }",
+        UNAVAILABLE_RE.pattern))
+
+
+def group_is_private_for_us(page) -> bool:
+    """جروب خاص والحساب مش عضو: «مجموعة خاصة» + زرار «انضمام» ومفيش موجز."""
+    return bool(page.evaluate(
+        """([priv, join]) => {
+          const main = document.querySelector("div[role='main']") || document.body;
+          const text = main.textContent || '';
+          return !document.querySelector("[role='feed']") && new RegExp(priv).test(text) && new RegExp(join).test(text);
+        }""",
+        [PRIVATE_RE.pattern, JOIN_RE.pattern],
     ))
 
 
@@ -339,10 +411,14 @@ def sort_comments_newest(page) -> str:
             break
         if no_comments_shown(page):
             return "no-comments"
+        if comments_off_shown(page):
+            return "comments-off"
         page.wait_for_timeout(700)
     opener = page.get_by_role("button", name=opener_name)
     if not opener.count():
-        return "no-comments" if no_comments_shown(page) else "missing"
+        if no_comments_shown(page):
+            return "no-comments"
+        return "comments-off" if comments_off_shown(page) else "missing"
     try:
         target = opener.last
         target.scroll_into_view_if_needed(timeout=4000)
@@ -363,15 +439,19 @@ def sort_comments_newest(page) -> str:
     return "unverified"
 
 
-def expand_comments(page, rounds: int = 30) -> None:
-    """يفتح كل التعليقات وكل أشجار الردود. لا يضغط زر «رد» نفسه."""
+def expand_comments(page, rounds: int = 30) -> int:
+    """يفتح كل التعليقات وكل أشجار الردود. لا يضغط زر «رد» نفسه. بيرجّع كام زرار اتضغط.
+
+    textContent مش innerText: innerText بيعمل layout للنافذة كلها مع كل زرار (2.6 ثانية للنداء).
+    """
+    total = 0
     for _ in range(rounds):
         clicked = page.evaluate(
             r"""() => {""" + POST_ROOT_JS + r"""
               const root = postRoot();
               const wanted = /عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|View more comments|View previous comments|View more replies|View all \d+ replies|View \d+ repl/;
               const buttons = [...root.querySelectorAll('[role="button"]')].filter(e => {
-                const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
+                const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
                 return t && t !== 'رد' && t !== 'Reply' && wanted.test(t);
               });
               if (!buttons.length) return 0;
@@ -390,13 +470,15 @@ def expand_comments(page, rounds: int = 30) -> None:
                 r"""() => {""" + POST_ROOT_JS + r"""
                   const root = postRoot();
                   const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|View more comments|View .*repl/;
-                  return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.innerText || '').replace(/\s+/g, ' ').trim()));
+                  return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.textContent || '').replace(/\s+/g, ' ').trim()));
                 }"""
             )
             if not clicked:
-                return
+                return total
             continue
+        total += clicked
         page.wait_for_timeout(1100)
+    return total
 
 
 def visible_snapshot(page, group_id: str, post_id: str) -> dict:
@@ -445,7 +527,9 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
               author_id: userIdFrom(authorLink ? authorLink.href : ''),
               author_url: authorLink ? clean(authorLink.href) : '',
               text,
-              has_media: !!article.querySelector("img[src*='scontent'], a[href*='/photo/'], video"),
+              // ستيكر/GIF/صورة: أي img أو video برّه نص التعليق (الإيموجي img جوه dir=auto، والصورة الشخصية svg)
+              has_media: [...article.querySelectorAll("img, video")].some(n => !n.closest("div[dir='auto']"))
+                || !!article.querySelector("a[href*='/photo/']"),
               created_time: /[0-9٠-٩]{4}/.test(timeAria) ? timeAria : (timeNode ? (timeNode.innerText || '').trim() : ''),
               aria_label: article.getAttribute('aria-label') || ''
             });
@@ -470,13 +554,19 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
           const sharedLink = [...scope.querySelectorAll("a[href*='/posts/'], a[href*='permalink.php'], a[href*='story_fbid=']")]
             .map(a => a.href)
             .find(h => !h.includes(`/groups/${groupId}/`) && !h.includes('multi_permalinks') && !h.includes('comment_id=')) || '';
+          const videos = [...scope.querySelectorAll('video')];
+          const videoLink = [...scope.querySelectorAll("a[href*='/reel/'], a[href*='/videos/'], a[href*='/watch/']")]
+            .map(a => a.href)[0] || '';
           let text = msg ? msg.innerText.trim() : '';
-          if (!text && sharedLink) {
+          // فيديو/ريل/منشور متشارك: الوصف مش في data-ad-preview
+          if (!text && (sharedLink || videoLink || videos.length)) {
             const skip = new RegExp(ids.noComments + '|·');
             const candidates = [...scope.querySelectorAll("div[dir='auto'], span[dir='auto']")]
               .filter(n => !n.closest("[role='article'][aria-label]"))     // التعليقات جوه article المنشور
               .map(n => (n.innerText || '').trim())
-              .filter(t => t && t !== author && !skip.test(t));
+              .filter(t => t && t !== author && !skip.test(t) && !/المقطع الصوتي|Original audio/i.test(t))
+              .map(t => t.replace(/(\.\.\.|…)?\s*(عرض المزيد|See more)\s*$/, '').trim())
+              .filter(t => t.length > 1);
             let best = candidates.sort((a, b) => b.length - a.length)[0] || '';
             // فيسبوك بيرسم النص مرتين (الظاهر + نسخة «عرض المزيد») جوه نفس العنصر
             const half = best.length / 2;
@@ -488,18 +578,21 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
           const external = [...scope.querySelectorAll("a[href*='l.facebook.com/l.php']")].map(a => {
             try { return clean(decodeURIComponent(new URL(a.href).searchParams.get('u') || '')); } catch (e) { return ''; }
           }).find(u => u && !/facebook\.com|fbcdn|meta\.ai/.test(u)) || '';
-          const videos = [...scope.querySelectorAll('video')];
-          // src الفيديو غالبًا blob: مالوش قيمة برّه الصفحة، فبنعلّم النوع بس
-          const videoUrl = videos.map(v => v.currentSrc || v.src).find(u => /^https?:/.test(u || '')) || '';
+          // src الفيديو غالبًا blob: مالوش قيمة برّه الصفحة؛ رابط الريل/الفيديو نفسه أحسن
+          const videoUrl = videos.map(v => v.currentSrc || v.src).find(u => /^https?:/.test(u || ''))
+            || (videoLink ? clean(videoLink) : '');
           const photo = [...scope.querySelectorAll("a[href*='/photo/'], a[href*='/photos/']")].map(a => clean(a.href))[0] || '';
           const shared = sharedLink ? clean(sharedLink) : '';
-          const kind = videos.length ? 'video' : external ? 'link' : shared ? 'share' : photo ? 'photo' : (text ? 'text' : '');
+          const isVideo = videos.length > 0 || !!videoLink;
+          const kind = isVideo ? 'video' : external ? 'link' : shared ? 'share' : photo ? 'photo' : (text ? 'text' : '');
+          // فيديو مايخدش رابط الصورة المصغّرة كأنه هو
+          const media = isVideo ? videoUrl : (external || shared || photo);
           return {
             text,
             // «post content» في الشيت: الرابط/الميديا لو موجودة، وإلا النص — زي ما كان
-            post_content: videoUrl || external || shared || photo || text,
+            post_content: media || text,
             content_kind: kind,
-            media_url: videoUrl || external || shared || photo,
+            media_url: media,
             story_found: !!story,
             author,
             author_id: userIdFrom(authorLink ? authorLink.href : ''),
@@ -545,8 +638,9 @@ def normalize_comment(raw: dict, group_id: str, post_id: str) -> dict | None:
     }
 
 
-def scroll_comment_pane(page) -> None:
-    page.evaluate(
+def scroll_comment_pane(page) -> bool:
+    """بيمرّر أطول حاوية قابلة للتمرير. بيرجّع True لو اتحركت فعلًا (False = آخر القايمة)."""
+    return bool(page.evaluate(
         r"""() => {""" + POST_ROOT_JS + r"""
           const root = postRoot();
           const nodes = [root, ...root.querySelectorAll('div')];
@@ -559,10 +653,37 @@ def scroll_comment_pane(page) -> None:
               room = left;
             }
           }
-          if (best) best.scrollTop += Math.max(700, best.clientHeight * 0.8);
-          else window.scrollBy(0, 900);
+          if (best) {
+            const before = best.scrollTop;
+            best.scrollTop += Math.max(700, best.clientHeight * 0.8);
+            return best.scrollTop > before;
+          }
+          const y = window.scrollY;
+          window.scrollBy(0, 900);
+          return window.scrollY > y;
         }"""
-    )
+    ))
+
+
+_KIND_RANK = {"": 0, "text": 1, "photo": 2, "link": 3, "share": 3, "video": 4}
+
+
+def richer_header(snap: dict, header: dict) -> bool:
+    """لقطة أحدث أغنى من اللي عندنا؟ (فيديو اترسم بعد أول لقطة مثلًا)"""
+    if not snap.get("post_content") and not snap.get("content_kind"):
+        return False
+    return _KIND_RANK.get(snap.get("content_kind") or "", 0) > _KIND_RANK.get(header.get("content_kind") or "", 0) \
+        or not header.get("post_content")
+
+
+def unavailable_post(group_id: str, post_id: str, url: str) -> dict:
+    return {
+        "group_id": group_id, "post_id": post_id, "permalink": url, "url": url, "unavailable": True,
+        "author": "", "author_id": "", "author_url": "", "text": "", "post_content": "", "content_kind": "",
+        "media_url": "", "created_time": "", "created_time_raw": "", "comment_sort": "unavailable",
+        "comments_found": 0, "replies_found": 0, "comments_shortfall": False, "comments_over_max": False,
+        "capture_mode": "incremental", "sheet_batches": 0, "comments": [],
+    }
 
 
 def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_comments: int, on_batch=None, batch_size: int = 80) -> dict:
@@ -580,9 +701,19 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
         if sort_state in SORT_OK:
             break
         page.wait_for_timeout(1200)
+    if post_unavailable(page):
+        # اتمسح أو اتخفى بعد ما شفناه في الموجز: مش فشل فرز، المنشور نفسه مش موجود
+        return unavailable_post(group_id, post_id, url)
     if f"/posts/{post_id}" not in (page.url or ""):
         raise SystemExit(f"فيسبوك نقل الصفحة بعيد عن المنشور {post_id}: {page.url}")
     if sort_state not in SORT_OK:
+        # آخر تأكيد قبل ما نوقف التشغيل كله: يمكن المنشور اتمسح والنص ماوصلش للفحص اللي في الصفحة
+        try:
+            gone = bool(UNAVAILABLE_RE.search(page.content()))
+        except Exception:
+            gone = False
+        if gone:
+            return unavailable_post(group_id, post_id, url)
         raise SystemExit(f"فرز التعليقات مش «الأحدث» على المنشور {post_id}: {sort_state}")
     seen: dict[str, dict] = {}
     order: list[str] = []
@@ -592,16 +723,21 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     header = {}
     # فيسبوك بيمسح التعليقات القديمة من الصفحة لما العدد يبقى بالآلاف،
     # فلازم نلتقط الظاهر قبل التمرير، ونفتح الردود، لحد ما مفيش جديد.
-    # من غير تعليقات: لقطة واحدة للهيدر وخلاص، بدل 5 لفّات تمرير فاضية
-    for _ in range(1 if sort_state == "no-comments" else 400):
+    # من غير تعليقات: لقطات الهيدر بس (لحد 3، ثانية بين كل واحدة) بدل 5 لفّات تمرير فاضية.
+    # لقطة واحدة ماكانتش كفاية: الفيديو كان لسه مارسمش فالنوع اتسجّل فاضي (اتشاف في تشغيل حقيقي).
+    no_comments = sort_state in NO_COMMENT_STATES
+    for round_no in range(3 if no_comments else 400):
         if len(order) >= max_comments:
             break
+        if no_comments and round_no:
+            page.wait_for_timeout(1000)
         snap = visible_snapshot(page, group_id, post_id)
-        if snap.get("post_content") and not header.get("post_content"):
+        if richer_header(snap, header):
             header["post_content"] = snap["post_content"]
             header["content_kind"] = snap.get("content_kind") or ""
-            header["text"] = snap.get("text") or ""
             header["media_url"] = snap.get("media_url") or ""
+        if snap.get("text") and not header.get("text"):
+            header["text"] = snap["text"]
         if snap.get("author"):
             header["author"] = snap.get("author") or header.get("author") or ""
             header["author_id"] = snap.get("author_id") or header.get("author_id") or ""
@@ -624,16 +760,20 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             del pending[:batch_size]
             batch_index += 1
             on_batch(batch, batch_index, False)
-        if sort_state == "no-comments":
-            break
-        expand_comments(page, rounds=1)
+        if no_comments:
+            if header.get("content_kind"):
+                break
+            continue
+        expanded = expand_comments(page, rounds=1)
         if added:
             stale = 0
         else:
             stale += 1
-        scroll_comment_pane(page)
+        moved = scroll_comment_pane(page)
         page.wait_for_timeout(700)
-        if stale >= 5:
+        # آخر القايمة: مفيش «عرض المزيد» والتمرير ماتحركش — لفّتين كفاية مش 5
+        # (5 لفّات فاضية أخدت ~150 ثانية على منشور واحد في تشغيل حقيقي)
+        if stale >= 5 or (stale >= 2 and not expanded and not moved):
             break
     if on_batch and pending:
         batch_index += 1
@@ -675,9 +815,12 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
     except Exception:
         name = ""
     posts = []
+    unavailable: list[str] = []
 
     def result() -> dict:
-        return _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts)
+        out = _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts)
+        out["posts_unavailable"] = list(unavailable)
+        return out
 
     for post_id in post_ids:
         def on_batch(comments, batch_index, done):
@@ -706,6 +849,12 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
             on_batch=None,
             batch_size=batch_size,
         )
+        if post.get("unavailable"):
+            # اتمسح/اتخفى: مالوش صف في الشيت، بس بيتسجّل في الدَمب
+            print(f"{group_id}/{post_id}: unavailable (اتمسح أو اتخفى) — اتعدّى")
+            unavailable.append(post_id)
+            time.sleep(1.5)
+            continue
         print(
             f"{group_id}/{post_id}: comments={post['comments_found']} "
             f"replies={post['replies_found']} sort={post['comment_sort']}"
@@ -818,7 +967,8 @@ def main() -> None:
                 )
                 results.append(without_token(payload))
                 print("saved", save(payload))
-                if not args.dry and not any(p.get("sheet_batches") for p in payload["posts"]):
+                # جروب من غير منشورات (خاص، فاضي): مفيش حاجة تتبعت
+                if not args.dry and payload["posts"] and not any(p.get("sheet_batches") for p in payload["posts"]):
                     answer = sheet_post(payload)
                     print("sheet:", answer[:400])
             # من غير ده، --trace في تشغيل ناجح بيرمي التتبّع ويسيب الـ HAR لوحده

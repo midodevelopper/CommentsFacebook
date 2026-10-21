@@ -529,7 +529,7 @@ def test_archive_group_return_contract(flow):
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 2, 5, 1, 10)
     assert list(out.keys()) == ["token", "group_id", "group_url", "group_name", "sort_posts",
                                 "feed_sort_label", "sort_comments", "limits", "posts_found",
-                                "posts_shortfall", "posts"]
+                                "posts_shortfall", "posts", "posts_unavailable"]   # + D-33: skipped deleted posts
     assert out["token"] == scraper.TOKEN
     assert out["group_url"] == f"https://www.facebook.com/groups/{G}"
     assert out["sort_posts"] == "CHRONOLOGICAL" and out["sort_comments"] == "الأحدث"
@@ -684,7 +684,7 @@ def test_main_dump_files_do_not_contain_the_sheet_token(monkeypatch, main_env):
 
 
 def test_main_still_sends_token_to_sheet(monkeypatch, main_env):
-    monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
+    monkeypatch.setattr(scraper, "archive_group", fake_archive({"1": [{"post_id": "9", "sheet_batches": 0}]}))
     run_main(monkeypatch, *BASE)
     assert main_env["sent"][0]["token"] == scraper.TOKEN
 
@@ -696,11 +696,17 @@ def test_main_dump_keeps_unicode_unescaped(monkeypatch, main_env):
     assert "نص 🌙" in (main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8")
 
 
-def test_main_fallback_send_only_when_no_post_was_batched(monkeypatch, main_env):
-    """Characterization: with zero posts and not --dry, the whole group payload (posts=[]) is sent once."""
+def test_main_sends_nothing_for_a_group_without_posts(monkeypatch, main_env):
+    """Fixed: a group with zero posts (private, empty) used to send its whole empty payload."""
     monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
     run_main(monkeypatch, *BASE)
-    assert len(main_env["sent"]) == 1 and main_env["sent"][0]["posts"] == []
+    assert main_env["sent"] == []
+
+
+def test_main_fallback_send_when_posts_exist_but_none_were_batched(monkeypatch, main_env):
+    monkeypatch.setattr(scraper, "archive_group", fake_archive({"1": [{"post_id": "9", "sheet_batches": 0}]}))
+    run_main(monkeypatch, *BASE)
+    assert len(main_env["sent"]) == 1 and main_env["sent"][0]["posts"][0]["post_id"] == "9"
 
 
 def test_main_no_fallback_send_when_posts_were_batched(monkeypatch, main_env):
@@ -876,3 +882,32 @@ def test_main_keeps_finished_posts_when_a_later_post_fails(monkeypatch, main_env
         run_main(monkeypatch, *BASE)
     saved = json.loads((main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8"))
     assert saved == {"group_id": "1", "posts": [{"post_id": "9"}]}
+
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("11 أكتوبر الساعة 5:38 ص", "2026-10-11 05:38"),          # live run 5: no year when older than ~a day
+    ("8 أكتوبر الساعة 10:53 ص", "2026-10-08 10:53"),
+    ("October 11 at 5:38 AM", "2026-10-11 05:38"),
+    ("28 ديسمبر الساعة 9:00 م", "2025-12-28 21:00"),          # would be in the future -> last year
+    ("14 أغسطس", "2026-08-14 00:00"),
+])
+def test_normalize_fb_time_without_year(text, expected):
+    assert scraper.normalize_fb_time(text, NOW) == expected
+
+
+def test_archive_group_skips_unavailable_posts(flow, monkeypatch):
+    """Fixed D-33 (live run 5): a post deleted between feed and visit used to abort the whole group."""
+    calls, data = flow
+    data.update({"11": 1, "12": 0, "13": 2})
+    real = scraper.scrape_post
+
+    def scrape(page, group_id, post_id, *a, **k):
+        if post_id == "12":
+            return scraper.unavailable_post(group_id, post_id, "u")
+        return real(page, group_id, post_id, *a, **k)
+    monkeypatch.setattr(scraper, "scrape_post", scrape)
+    out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10, dry=False)
+    assert [p["post_id"] for p in out["posts"]] == ["11", "13"]
+    assert out["posts_unavailable"] == ["12"]
+    assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["11", "13"]

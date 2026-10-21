@@ -270,10 +270,18 @@ def test_expand_english_ui(page, fake_fb):
     assert page.locator("[role=article][data-cid]").count() == 5
 
 
-def test_expand_returns_when_nothing_to_expand(page, fake_fb):
+def test_expand_returns_zero_when_nothing_to_expand(page, fake_fb):
     open_post(page, fake_fb, Post("1", comments=comments(2), sort_mode="newest"))
-    assert scraper.expand_comments(page, rounds=30) is None
+    assert scraper.expand_comments(page, rounds=30) == 0
     assert clicks(page) == []
+
+
+def test_expand_returns_number_of_buttons_clicked(page, fake_fb):
+    cs = comments(3)
+    cs[0].replies = [Comment(id="801")]
+    cs[2].replies = [Comment(id="802")]
+    open_post(page, fake_fb, Post("1", comments=cs, sort_mode="newest"))
+    assert scraper.expand_comments(page, rounds=30) == 2
 
 
 # ---------------------------------------------------------------- visible_snapshot
@@ -597,3 +605,110 @@ def test_snapshot_own_group_links_are_not_shares(page, fake_fb):
     open_post(page, fake_fb, Post("77", message="منشور عادي", sort_mode="newest",
                                   comments=[Comment(id="501")]))
     assert scraper.visible_snapshot(page, G, "77")["content_kind"] == "text"
+
+
+
+# ---------------------------------------------------------------- round 3 (live run 5)
+
+def test_sort_comments_off(page, fake_fb):
+    """Fixed D-34 (live run 5): «تم إيقاف تشغيل التعليقات» — no sort control and no none-text."""
+    open_post(page, fake_fb, Post("1", comments=[], sort_mode="none", comments_off=True))
+    assert scraper.sort_comments_newest(page) == "comments-off"
+
+
+def test_scrape_post_comments_off_is_archived(page, fake_fb):
+    out = scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", comments_off=True, message="نص"))
+    assert out["comment_sort"] == "comments-off" and out["comments"] == [] and out["text"] == "نص"
+
+
+def test_scrape_post_unavailable_post_is_not_a_failure(page, fake_fb):
+    """Fixed D-33 (live run 5): the post was deleted between feed and visit."""
+    fake_fb.add_group(Group(G))
+    out = scraper.scrape_post(page, G, "404404", 0, 20)
+    assert out["unavailable"] is True and out["comment_sort"] == "unavailable" and out["comments"] == []
+
+
+def test_collect_private_group_not_member(page, fake_fb, capsys):
+    """Live run 5: a private group the account isn't in has no feed; say so instead of scrolling."""
+    fake_fb.add_group(Group(G, private=True))
+    assert scraper.collect_post_ids(page, G, 5) == ([], "")
+    assert "خاص" in capsys.readouterr().err
+
+
+def test_member_group_is_not_reported_private(page, fake_fb):
+    fake_fb.add_group(Group(G), [Post("1")])
+    page.goto(f"https://www.facebook.com/groups/{G}")
+    assert scraper.group_is_private_for_us(page) is False
+
+
+def test_snapshot_reel_caption_and_link(page, fake_fb):
+    """Fixed D-37 (live run 5): a reel/video caption is not in data-ad-preview; it was stored empty,
+    and the video's media_url was its photo thumbnail."""
+    open_post(page, fake_fb, Post("77", message=None, video_src="blob:https://www.facebook.com/x",
+                                  video_caption="وكنتُ أظنني الأقسى", reel_link="https://www.facebook.com/reel/157766/",
+                                  sort_mode="newest"))
+    snap = scraper.visible_snapshot(page, G, "77")
+    assert snap["content_kind"] == "video"
+    assert snap["text"] == "وكنتُ أظنني الأقسى"                    # no "... عرض المزيد", no audio credit line
+    assert snap["media_url"] == "https://www.facebook.com/reel/157766/"
+
+
+def test_snapshot_comment_sticker_counts_as_media(page, fake_fb):
+    open_post(page, fake_fb, Post("77", comments=[Comment(id="501", text="")], sort_mode="newest"))
+    page.evaluate("""() => { const a = document.querySelector("[data-cid='501']");
+        const img = document.createElement('img'); img.src = 'https://static.xx.fbcdn.net/sticker.png'; a.append(img); }""")
+    assert scraper.visible_snapshot(page, G, "77")["comments"][0]["has_media"] is True
+
+
+def test_snapshot_emoji_inside_text_is_not_media(page, fake_fb):
+    open_post(page, fake_fb, Post("77", comments=[Comment(id="501", text="تمام")], sort_mode="newest"))
+    page.evaluate("""() => { const t = document.querySelector("[data-cid='501'] div[dir='auto']");
+        const img = document.createElement('img'); img.alt = '😀'; t.append(img); }""")
+    assert scraper.visible_snapshot(page, G, "77")["comments"][0]["has_media"] is False
+
+
+def test_scrape_post_no_comments_waits_for_late_video(page, fake_fb, monkeypatch):
+    """Fixed D-36 (live run 5): the single header snapshot came before the video rendered."""
+    real = scraper.visible_snapshot
+    seen = []
+
+    def late(p, g, pid):
+        snap = real(p, g, pid)
+        if len(seen) < 1:                        # first snapshot: player not rendered yet
+            snap = {**snap, "content_kind": "", "post_content": "", "media_url": ""}
+        seen.append(snap["content_kind"])
+        return snap
+    monkeypatch.setattr(scraper, "visible_snapshot", late)
+    out = scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", video_src="https://v.example/v.mp4"))
+    assert seen == ["", "video"]
+    assert out["content_kind"] == "video"
+
+
+def test_scrape_post_stops_early_at_end_of_list(page, fake_fb, monkeypatch):
+    """Perf (live run 5: 14 rounds for 16 comments): with no expanders and no scroll movement,
+    two empty rounds end the loop instead of five."""
+    calls = []
+    real = scraper.visible_snapshot
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(scraper, "scroll_comment_pane", lambda p: False)
+    monkeypatch.setattr(scraper, "expand_comments", lambda p, rounds=1: 0)
+    out = scrape(page, fake_fb, Post("77", comments=comments(4)))
+    assert out["comments_found"] == 4
+    assert len(calls) == 3                      # 1 round with new comments + 2 empty
+
+
+def test_scrape_post_keeps_going_while_scrolling_moves(page, fake_fb, monkeypatch):
+    calls = []
+    real = scraper.visible_snapshot
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(scraper, "scroll_comment_pane", lambda p: True)
+    monkeypatch.setattr(scraper, "expand_comments", lambda p, rounds=1: 0)
+    scrape(page, fake_fb, Post("77", comments=comments(4)))
+    assert len(calls) == 6                      # 1 + 5 stale: the old safety net still applies
+
+
+def test_scroll_comment_pane_reports_movement(page, fake_fb):
+    open_post(page, fake_fb, Post("77", comments=comments(30), dialog=True, sort_mode="newest"))
+    assert scraper.scroll_comment_pane(page) is True
+    page.evaluate("document.querySelector('[role=dialog]').scrollTop = 1e9")
+    assert scraper.scroll_comment_pane(page) is False

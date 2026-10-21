@@ -66,6 +66,11 @@ class Post:
     # live 2026-10-21: a shared post has no data-ad-preview; the shared text sits in dir=auto blocks
     # (rendered twice: visible + "see more" copy) next to a link to the original /<page>/posts/pfbid...
     shared_text: str | None = None
+    # live 2026-10-21: «تم إيقاف تشغيل التعليقات لهذا المنشور من قبل …» — no sort control, no none-text
+    comments_off: bool = False
+    # live 2026-10-21: video/reel caption lives outside data-ad-preview, next to a /reel/ link
+    video_caption: str | None = None
+    reel_link: str | None = None
     shared_link: str = "https://www.facebook.com/somepage/posts/pfbid0SharedOriginal"
 
 
@@ -77,6 +82,7 @@ class Group:
     extra_links: list[str] = field(default_factory=list)
     # live 2026-10-21: the hidden Notifications panel (banner > dialog) holds other groups' post links
     notification_links: list[str] = field(default_factory=list)
+    private: bool = False                 # live 2026-10-21: private group, account not a member
     sort_label: str = "فرز موجز المجموعة: المنشورات الجديدة"
 
 
@@ -155,6 +161,10 @@ function render() {
     el('h2', {}, D.author_id ? el('a', {href: userUrl(D.author_id)}, D.author) : el('a', {href: `${base}/`}, D.author || '')),
     el('a', {href: `${base}/posts/${P}/?${tok}`, 'aria-label': D.created}, '٣ س'),
     D.message !== null && D.shared_text === null ? el('div', {'data-ad-preview': 'message'}, el('div', {dir: 'auto'}, D.message)) : null,
+    D.video_caption !== null ? el('div', {class: 'reel'},
+      D.reel_link ? el('a', {href: D.reel_link}, 'reel') : null,
+      el('div', {dir: 'auto'}, D.video_caption + '... عرض المزيد'),
+      el('div', {dir: 'auto'}, 'المقطع الصوتي الأصلي')) : null,
     D.shared_text !== null ? el('div', {class: 'shared'},
       el('a', {href: D.shared_link + '?' + tok}, 'صفحة المصدر'),
       el('div', {dir: 'auto'}, 'منذ ٢١ دقيقة · تمت المشاركة مع العامة'),
@@ -203,7 +213,8 @@ function render() {
     }
   }
   host.append(list);
-  if (!D.comments.length && D.no_comments_text) host.append(el('h3', {}, EN ? 'No comments yet' : 'لا توجد تعليقات حتى الآن'));
+  if (D.comments_off) host.append(el('div', {}, EN ? 'Commenting has been turned off for this post.' : 'تم إيقاف تشغيل التعليقات لهذا المنشور من قبل صاحبه.'));
+  else if (!D.comments.length && D.no_comments_text) host.append(el('h3', {}, EN ? 'No comments yet' : 'لا توجد تعليقات حتى الآن'));
   if (shown < all.length) host.append(el('div', {role: 'button', 'data-action': 'more'}, T.more));
   if (D.composer === 'bottom') host.append(composer('post'));
   host.append(el('div', {class: 'spacer'}));
@@ -265,6 +276,13 @@ _FEED_JS = r"""
 (() => {
 const D = window.__DATA;
 let shown = D.page_size;
+if (D.private) {
+  const priv = document.body.appendChild(document.createElement('div'));
+  priv.setAttribute('role', 'main');
+  priv.innerHTML = "<h1>جروب</h1><div>مجموعة \u200fخاصة\u200f · ٣٫٥ مليون عضو</div><div role='button'>انضمام إلى المجموعة</div>" +
+    "<div>يمكن للأعضاء فقط رؤية الأعضاء الموجودين بالمجموعة وما يقومون بنشره.</div>";
+  return;
+}
 if (D.notification_links.length) {
   const banner = document.body.appendChild(document.createElement('div'));
   banner.setAttribute('role', 'banner');
