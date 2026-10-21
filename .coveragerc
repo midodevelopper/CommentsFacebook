@@ -1,0 +1,12 @@
+# Coverage for the regression suite. `patch = subprocess` also measures the
+# scripts when tests run them as subprocesses (CLI tests).
+[run]
+branch = True
+patch = subprocess
+source = .
+omit =
+    tests/*
+    .venv/*
+
+[report]
+show_missing = True

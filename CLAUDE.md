@@ -140,6 +140,23 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
 
 ## سجل التحديثات
 
+### 2026-10-21 — خط أساس اختبارات الانحدار (regression baseline)
+- **`tests/` جديد**: ~350 اختبار offline بيوصفوا السلوك الحالي زي ما هو، قبل أي تعديل.
+  التشغيل: `.venv\Scripts\python.exe -m pytest` (التغطية: زوّد `--cov`).
+  **ليه:** كل إصلاح أو refactor جاي محتاج حاجة تقول «اتغير سلوك مكانش المفروض يتغير».
+- **محاكي فيسبوك offline** (`tests/fake_facebook.py`): كروميوم headless مؤقت + route
+  بيرد على `www.facebook.com` من بيانات في الذاكرة. **مش** البروفايل الحقيقي، ومفيش شبكة.
+  بيقلّد اللي الكود معتمد عليه بس — نجاح الاختبار مش دليل إن DOM فيسبوك الحقيقي لسه زي كده.
+- **`facebook_sheet_receiver.gs` بيتختبر بجد** تحت Node (`tests/apps_script/`) مع
+  SpreadsheetApp وهمي في الذاكرة بيقلّد تحويل الأرقام الطويلة لـ Number لو العمود مش نص.
+  ده الكود الحقيقي، مش mock من بايثون. الـ deployment الحقيقي والشيت الحقيقي مش بيتلمسوا.
+- **E2E كامل offline**: السكربتين الحقيقيين ← HTTP ← الـ `.gs` الحقيقي ← شيت في الذاكرة ← ردود.
+- **حارس شبكة** في `conftest.py`: أي اتصال لغير loopback أو لمنفذ 9333 بيفشل الاختبار.
+- الاختبارات اللي اسمها/وصفها `defect D-xx` **بتثبّت سلوك غلط حالي عن قصد**؛ لما يتصلّح،
+  الاختبار ده لازم يتعدّل في نفس الـ commit بتاع الإصلاح.
+- `tests/test_live.py` (المتصفح الحقيقي) مش بيشتغل غير بـ `--run-live`.
+- `requirements-dev.txt` (pytest, pytest-cov, pytest-timeout)، `pytest.ini`، `.coveragerc`.
+
 ### 2026-10-21 — فحص selectors، تتبّع Playwright، HAR، و MCP
 - **`browser_debug.py selectors` جديد** — بيختبر 20 selector المشروع معتمد عليها على
   صفحة حقيقية ويقول كل واحد لقى كام عنصر، مصنّفين `critical` / `degraded` / `context`،

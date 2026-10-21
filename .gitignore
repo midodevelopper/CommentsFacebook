@@ -33,3 +33,8 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Test coverage output
+.coverage
+.coverage.*
+htmlcov/
