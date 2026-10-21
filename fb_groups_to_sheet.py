@@ -340,7 +340,7 @@ POST_ROOT_JS = r"""
 
 
 # حالات فرز مقبولة: «الأحدث»، أو مفيش تعليقات خالص / التعليقات مقفولة (الترتيب مالوش معنى)
-SORT_OK = ("الأحدث", "no-comments", "comments-off")
+SORT_OK = ("الأحدث", "no-comments", "comments-off", "single-comment", "newest-by-time")
 # حالات مفيهاش تعليقات أصلًا: لقطة الهيدر وخلاص، من غير لفّات تمرير
 NO_COMMENT_STATES = ("no-comments", "comments-off")
 
@@ -388,6 +388,42 @@ def group_is_private_for_us(page) -> bool:
     ))
 
 
+def distinct_comment_ids(page) -> int:
+    """كام تعليق مختلف ظاهر (فيسبوك أحيانًا بيرسم نفس التعليق مرتين بنفس الـ id)."""
+    return int(page.evaluate(
+        "() => {" + POST_ROOT_JS + r"""
+          const ids = new Set();
+          postRoot().querySelectorAll("div[role='article'][aria-label] a[href*='comment_id=']").forEach(a => {
+            try {
+              const q = new URL(a.href).searchParams;
+              ids.add(q.get('reply_comment_id') || q.get('comment_id'));
+            } catch (e) {}
+          });
+          return ids.size;
+        }"""
+    ))
+
+
+def comments_newest_first(page) -> bool:
+    """التعليقات الظاهرة (من غير الردود) مترتبة من الأحدث للأقدم حسب وقتها الكامل؟
+
+    بنستخدمها بس بعد ما ضغطنا «الأحدث» فعلًا وفيسبوك شال الزرار، فمانقدرش نقرا الحالة منه.
+    دقة الوقت دقيقة، فالمتساوي مقبول. أي وقت مش مفهوم = مش متأكدين = False.
+    """
+    stamps = page.evaluate(
+        "() => {" + POST_ROOT_JS + r"""
+          return [...postRoot().querySelectorAll("div[role='article'][aria-label]")]
+            .map(a => a.querySelector("a[href*='comment_id=']"))
+            .filter(l => l && !new URL(l.href).searchParams.get('reply_comment_id'))
+            .map(l => l.getAttribute('aria-label') || l.innerText || '');
+        }"""
+    )
+    times = [normalize_fb_time(t) for t in stamps]
+    if not times or not all(re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", t) for t in times):
+        return False
+    return all(a >= b for a, b in zip(times, times[1:]))
+
+
 def close_open_menu(page) -> None:
     """Escape بس لو في قائمة مفتوحة. Escape من غير قائمة بيقفل نافذة المنشور نفسها
     وفيسبوك بيرجع للصفحة الرئيسية."""
@@ -418,7 +454,10 @@ def sort_comments_newest(page) -> str:
     if not opener.count():
         if no_comments_shown(page):
             return "no-comments"
-        return "comments-off" if comments_off_shown(page) else "missing"
+        if comments_off_shown(page):
+            return "comments-off"
+        # تعليق واحد بس: فيسبوك بيشيل زرار الفرز، والترتيب مالوش معنى (اتشاف في تشغيل حقيقي)
+        return "single-comment" if distinct_comment_ids(page) == 1 else "missing"
     try:
         target = opener.last
         target.scroll_into_view_if_needed(timeout=4000)
@@ -436,6 +475,9 @@ def sort_comments_newest(page) -> str:
     page.wait_for_timeout(2000)
     if page.get_by_role("button", name=name).count():
         return "الأحدث"
+    # ضغطنا «الأحدث» وفيسبوك شال الزرار خالص (اتشاف في تشغيل حقيقي): نتأكد من الترتيب نفسه بالوقت
+    if not page.get_by_role("button", name=opener_name).count() and comments_newest_first(page):
+        return "newest-by-time"
     return "unverified"
 
 
@@ -686,9 +728,27 @@ def unavailable_post(group_id: str, post_id: str, url: str) -> dict:
     }
 
 
+GOTO_ATTEMPTS = 3
+
+
+def goto_with_retry(page, url: str) -> None:
+    """فتح الصفحة قراءة بس فإعادة المحاولة آمنة. timeout واحد (60 ث) كان بيوقف جروب كامل."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    for attempt in range(1, GOTO_ATTEMPTS + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return
+        except PlaywrightTimeout:
+            if attempt == GOTO_ATTEMPTS:
+                raise
+            print(f"الصفحة مافتحتش في 60 ثانية ({url}) — محاولة {attempt + 1}", file=sys.stderr)
+            page.wait_for_timeout(5000)
+
+
 def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_comments: int, on_batch=None, batch_size: int = 80) -> dict:
     url = f"https://www.facebook.com/groups/{group_id}/posts/{post_id}/"
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    goto_with_retry(page, url)
     page.bring_to_front()
     page.wait_for_timeout(2500)
     sort_state = "missing"

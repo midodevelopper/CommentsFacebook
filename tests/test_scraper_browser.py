@@ -712,3 +712,94 @@ def test_scroll_comment_pane_reports_movement(page, fake_fb):
     assert scraper.scroll_comment_pane(page) is True
     page.evaluate("document.querySelector('[role=dialog]').scrollTop = 1e9")
     assert scraper.scroll_comment_pane(page) is False
+
+
+
+def _vanish_sort_after_pick(page):
+    page.evaluate("""() => document.addEventListener('click', e => {
+        if (e.target.closest('[data-action=pick]'))
+            setTimeout(() => { const s = document.querySelector('[data-action=sort]'); if (s) s.remove(); }, 0);
+    }, true)""")
+
+
+def _times(cs, minutes):
+    for c, m in zip(cs, minutes):
+        c.time = f"الأربعاء، 21 أكتوبر 2026 الساعة 8:{m:02d} م"
+    return cs
+
+
+def test_sort_control_vanishes_after_newest_verified_by_time(page, fake_fb):
+    """Fixed D-39 (live run 5b, trace-confirmed): «الأحدث» was clicked, then Facebook removed the sort
+    control; the label could not be read and the group stopped. The order itself is checked instead."""
+    cs = _times(comments(3), [16, 16, 10])           # newest first once sorted (equal minutes allowed)
+    open_post(page, fake_fb, Post("1", comments=cs))
+    _vanish_sort_after_pick(page)
+    assert scraper.sort_comments_newest(page) == "newest-by-time"
+
+
+def test_sort_control_vanishes_but_order_is_wrong_still_fails(page, fake_fb):
+    cs = _times(comments(3), [10, 16, 12])
+    open_post(page, fake_fb, Post("1", comments=cs, sort_mode="unverified"))
+    _vanish_sort_after_pick(page)
+    assert scraper.sort_comments_newest(page) == "unverified"
+
+
+def test_sort_control_vanishes_with_unreadable_times_still_fails(page, fake_fb):
+    cs = comments(2)
+    for c in cs:                                     # a time we can't parse = we can't prove the order
+        c.time = "?"
+    open_post(page, fake_fb, Post("1", comments=cs, sort_mode="unverified"))
+    _vanish_sort_after_pick(page)
+    assert scraper.sort_comments_newest(page) == "unverified"
+
+
+def test_sort_missing_with_one_duplicated_comment_is_single(page, fake_fb):
+    open_post(page, fake_fb, Post("1", comments=[Comment(id="501")], sort_mode="none", no_comments_text=False))
+    page.evaluate("""() => { const a = document.querySelector("[data-cid='501']"); a.after(a.cloneNode(true)); }""")
+    assert scraper.distinct_comment_ids(page) == 1
+    assert scraper.sort_comments_newest(page) == "single-comment"
+
+
+def test_sort_missing_with_two_comments_still_fails(page, fake_fb):
+    open_post(page, fake_fb, Post("1", comments=comments(2), sort_mode="none", no_comments_text=False))
+    assert scraper.sort_comments_newest(page) == "missing"
+
+
+def test_scrape_post_single_comment_is_extracted(page, fake_fb):
+    out = scrape(page, fake_fb, Post("77", comments=[Comment(id="501", text="وحيد")], sort_mode="none",
+                                     no_comments_text=False))
+    assert out["comment_sort"] == "single-comment"
+    assert [c["comment_id"] for c in out["comments"]] == ["501"]
+
+
+
+def test_goto_with_retry_recovers_from_one_timeout(page, fake_fb, monkeypatch):
+    """Fixed D-40 (live run 5c): one 60 s navigation timeout used to abort the whole group."""
+    from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+
+    fake_fb.add_group(Group(G), [Post("77", comments=comments(2))])
+    real = Page.goto
+    calls = []
+
+    def flaky(self, url, **kw):
+        calls.append(url)
+        if len(calls) == 1:
+            raise PlaywrightTimeout("Page.goto: Timeout 60000ms exceeded.")
+        return real(self, url, **kw)
+    monkeypatch.setattr(Page, "goto", flaky)
+    out = scraper.scrape_post(page, G, "77", 0, 20)
+    assert len(calls) == 2 and out["comments_found"] == 2
+
+
+def test_goto_with_retry_gives_up_after_three(page, monkeypatch):
+    from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+
+    calls = []
+
+    def always(self, url, **kw):
+        calls.append(url)
+        raise PlaywrightTimeout("Page.goto: Timeout 60000ms exceeded.")
+    monkeypatch.setattr(Page, "goto", always)
+    with pytest.raises(PlaywrightTimeout):
+        scraper.goto_with_retry(page, "https://www.facebook.com/groups/1/posts/2/")
+    assert len(calls) == 3
