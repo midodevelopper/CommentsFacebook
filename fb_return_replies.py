@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 
 WEBAPP = (
     "https://script.google.com/macros/s/"
-    "AKfycbxV6e807bE6rooDlnk35nazr8QvJBruwlPo50ybCD_CMHG9WHN6kUPpFxe8m7ri8_ZqXw/exec"
+    "AKfycbxk49tkf3Q5B5Nv58DcGqrz1_EGrPAbo65PRap9J3EBDnXfpX1W1bCFK868hNGIM4mc3Q/exec"
 )
 TOKEN = os.environ.get("FB_SHEET_TOKEN", "CommentSecrets")
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
