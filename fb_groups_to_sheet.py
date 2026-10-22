@@ -324,6 +324,10 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
             break
         page.mouse.wheel(0, 2200)
         page.wait_for_timeout(1800)
+    if not ids:
+        # جروب مش موجود كان بيخلص بـ 0 منشورات من غير ما يقول حاجة (اتشاف في تشغيل حقيقي)
+        print(f"موجز الجروب {group_id} مافيهوش ولا منشور ظاهر — الجروب مش موجود أو فاضي أو مش متاح للحساب",
+              file=sys.stderr)
     return ids[:max_posts], label
 
 
@@ -610,9 +614,16 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
               .map(t => t.replace(/(\.\.\.|…)?\s*(عرض المزيد|See more)\s*$/, '').trim())
               .filter(t => t.length > 1);
             let best = candidates.sort((a, b) => b.length - a.length)[0] || '';
-            // فيسبوك بيرسم النص مرتين (الظاهر + نسخة «عرض المزيد») جوه نفس العنصر
-            const half = best.length / 2;
-            if (best.length % 2 === 0 && best.slice(0, half) === best.slice(half)) best = best.slice(0, half);
+            // فيسبوك بيرسم النص مرتين (الظاهر + نسخة «عرض المزيد») جوه نفس العنصر،
+            // ساعات لازقين وساعات بينهم سطر جديد (اتشاف على منشور متشارك حقيقي)
+            for (const sep of ['', '\n', ' ']) {
+              const half = (best.length - sep.length) / 2;
+              if (half > 0 && Number.isInteger(half) && best.slice(half, half + sep.length) === sep
+                  && best.slice(0, half) === best.slice(half + sep.length)) {
+                best = best.slice(0, half);
+                break;
+              }
+            }
             text = best;
           }
           if (!text) text = titleText;
@@ -631,8 +642,9 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
           const media = isVideo ? videoUrl : (external || shared || photo);
           return {
             text,
-            // «post content» في الشيت: الرابط/الميديا لو موجودة، وإلا النص — زي ما كان
-            post_content: media || text,
+            // «post content» في الشيت: الرابط/الميديا لو موجودة، وإلا النص — زي ما كان.
+            // فيديو src بتاعه blob ومن غير وصف: رابط المنشور نفسه هو رابط الفيديو، بدل خانة فاضية
+            post_content: media || text || (isVideo ? `https://www.facebook.com/groups/${groupId}/posts/${postId}/` : ''),
             content_kind: kind,
             media_url: media,
             story_found: !!story,
@@ -729,6 +741,8 @@ def unavailable_post(group_id: str, post_id: str, url: str) -> dict:
 
 
 GOTO_ATTEMPTS = 3
+# لقطات هيدر منشور من غير تعليقات، ثانية بين كل واحدة، لحد ما نوع المحتوى يبان
+HEADER_ROUNDS = 8
 
 
 def goto_with_retry(page, url: str) -> None:
@@ -783,10 +797,11 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     header = {}
     # فيسبوك بيمسح التعليقات القديمة من الصفحة لما العدد يبقى بالآلاف،
     # فلازم نلتقط الظاهر قبل التمرير، ونفتح الردود، لحد ما مفيش جديد.
-    # من غير تعليقات: لقطات الهيدر بس (لحد 3، ثانية بين كل واحدة) بدل 5 لفّات تمرير فاضية.
-    # لقطة واحدة ماكانتش كفاية: الفيديو كان لسه مارسمش فالنوع اتسجّل فاضي (اتشاف في تشغيل حقيقي).
+    # من غير تعليقات: لقطات الهيدر بس (ثانية بين كل واحدة) بدل 5 لفّات تمرير فاضية،
+    # لحد ما النوع يبان. منشور فيه نص بيخلص من أول لقطة؛ الانتظار بيبقى بس لمنشور مالوش نص ولا ميديا لسه.
+    # لقطة واحدة ماكانتش كفاية (D-36)، و 3 كمان لأ: فيديو من غير وصف اترسم بعد أكتر من 3 ثواني (D-41).
     no_comments = sort_state in NO_COMMENT_STATES
-    for round_no in range(3 if no_comments else 400):
+    for round_no in range(HEADER_ROUNDS if no_comments else 400):
         if len(order) >= max_comments:
             break
         if no_comments and round_no:

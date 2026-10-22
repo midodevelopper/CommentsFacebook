@@ -635,10 +635,35 @@ def test_collect_private_group_not_member(page, fake_fb, capsys):
     assert "خاص" in capsys.readouterr().err
 
 
+def test_collect_empty_feed_says_so(page, fake_fb, capsys):
+    """Live (5c follow-up): a group that doesn't exist ended with 0 posts and no message."""
+    fake_fb.add_group(Group(G))
+    assert scraper.collect_post_ids(page, G, 5)[0] == []
+    assert "مافيهوش ولا منشور ظاهر" in capsys.readouterr().err
+
+
 def test_member_group_is_not_reported_private(page, fake_fb):
     fake_fb.add_group(Group(G), [Post("1")])
     page.goto(f"https://www.facebook.com/groups/{G}")
     assert scraper.group_is_private_for_us(page) is False
+
+
+def test_snapshot_captionless_blob_video_uses_post_link(page, fake_fb):
+    """Fixed D-41 (live runs 5/5b/5c): a captionless video with a blob: src had empty post content."""
+    open_post(page, fake_fb, Post("77", message=None, video_src="blob:https://www.facebook.com/x", sort_mode="newest"))
+    snap = scraper.visible_snapshot(page, G, "77")
+    assert snap["content_kind"] == "video" and snap["text"] == "" and snap["media_url"] == ""
+    assert snap["post_content"] == f"https://www.facebook.com/groups/{G}/posts/77/"
+
+
+def test_snapshot_shared_text_doubled_with_newline_is_kept_once(page, fake_fb):
+    """Live run 4 page re-run on current code: the shared text came out as «A\\nA»."""
+    open_post(page, fake_fb, Post("77", message=None, shared_text="x", sort_mode="newest",
+                                  comments=[Comment(id="501", text="ربنا يستر")]))
+    page.evaluate("""() => { const d = document.querySelector('.shared div:last-child');
+        d.replaceChildren(...['سيدة محتاجة سيارة إسعاف', 'سيدة محتاجة سيارة إسعاف'].map(t => {
+          const c = document.createElement('div'); c.textContent = t; return c; })); }""")
+    assert scraper.visible_snapshot(page, G, "77")["text"] == "سيدة محتاجة سيارة إسعاف"
 
 
 def test_snapshot_reel_caption_and_link(page, fake_fb):
@@ -682,6 +707,31 @@ def test_scrape_post_no_comments_waits_for_late_video(page, fake_fb, monkeypatch
     out = scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", video_src="https://v.example/v.mp4"))
     assert seen == ["", "video"]
     assert out["content_kind"] == "video"
+
+
+def test_scrape_post_no_comments_waits_past_three_snapshots(page, fake_fb, monkeypatch):
+    """Fixed D-41 (live 5c): a captionless video rendered after the 3rd header snapshot; kind stayed empty."""
+    real = scraper.visible_snapshot
+    seen = []
+
+    def late(p, g, pid):
+        snap = real(p, g, pid)
+        if len(seen) < 5:
+            snap = {**snap, "content_kind": "", "post_content": "", "media_url": ""}
+        seen.append(snap["content_kind"])
+        return snap
+    monkeypatch.setattr(scraper, "visible_snapshot", late)
+    out = scrape(page, fake_fb, Post("77", message=None, comments=[], sort_mode="none",
+                                     video_src="blob:https://www.facebook.com/x"))
+    assert seen == [""] * 5 + ["video"]
+    assert out["content_kind"] == "video" and out["post_content"].endswith("/posts/77/")
+
+
+def test_scrape_post_no_comments_header_rounds_are_bounded(page, fake_fb, monkeypatch):
+    calls = []
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or {"comments": []})
+    scrape(page, fake_fb, Post("77", comments=[], sort_mode="none"))
+    assert len(calls) == scraper.HEADER_ROUNDS
 
 
 def test_scrape_post_stops_early_at_end_of_list(page, fake_fb, monkeypatch):
