@@ -970,9 +970,40 @@ def _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments,
     }
 
 
+GROUPS_FILE = Path(__file__).resolve().parent / "groups.txt"
+
+
+def read_groups_file(path: Path) -> list[str]:
+    """ملف الجروبات: سطر لكل جروب — رابط أو id بس. السطور الفاضية و # بتتجاهل، و «- » في أول السطر
+    (قايمة markdown) مقبولة، والمكرر بيتشال. أي سطر مش جروب بيوقف التشغيل برقم السطر بدل ما يتنسي."""
+    if not path.exists():
+        raise SystemExit(f"مفيش --group ومفيش ملف جروبات: {path} — اعمله زي groups.example.txt")
+    urls: list[str] = []
+    seen: set[str] = set()
+    for number, raw in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = re.sub(r"^\s*[-*]\s+", "", raw).split(" #", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.isdigit():
+            line = f"https://www.facebook.com/groups/{line}/"
+        match = GROUP_RE.search(line)
+        if not match:
+            raise SystemExit(f"{path.name} سطر {number}: مش رابط جروب فيسبوك: {raw.strip()}")
+        if match.group(1) in seen:
+            continue
+        seen.add(match.group(1))
+        urls.append(line)
+    if not urls:
+        raise SystemExit(f"ملف الجروبات فاضي: {path}")
+    return urls
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="أرشفة جروبات فيسبوك إلى Google Sheet")
-    parser.add_argument("--group", action="append", required=True, help="رابط جروب. كرره لأكتر من جروب")
+    parser.add_argument("--group", action="append",
+                        help="رابط جروب. كرره لأكتر من جروب. من غيره: الجروبات من groups.txt")
+    parser.add_argument("--groups-file", default=None,
+                        help="ملف الجروبات (سطر لكل جروب). الافتراضي groups.txt في فولدر المشروع")
     parser.add_argument("--min-posts", type=int, required=True)
     parser.add_argument("--max-posts", type=int, required=True)
     parser.add_argument("--min-comments", type=int, required=True)
@@ -991,6 +1022,10 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("min-comments مش سالب، وmax-comments أكبر منه أو يساويه")
     if args.batch_size < 1:
         raise SystemExit("batch-size لازم يكون 1 أو أكتر")
+    if not args.group:
+        groups_file = Path(args.groups_file) if args.groups_file else GROUPS_FILE
+        args.group = read_groups_file(groups_file)
+        print(f"{len(args.group)} جروب من {groups_file}", file=sys.stderr)
     return args
 
 

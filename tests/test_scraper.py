@@ -409,6 +409,65 @@ def test_sheet_post_timeout_is_90_seconds_and_retried(monkeypatch, no_sleep):
     assert seen == [90, 90, 90]
 
 
+# ---------------------------------------------------------------- groups.txt
+
+LIMITS = ["--min-posts", "1", "--max-posts", "5", "--min-comments", "0", "--max-comments", "30"]
+
+
+def lines(*rows):
+    return "".join(r + "\n" for r in rows)
+
+
+def test_without_group_reads_groups_file(monkeypatch, tmp_path, capsys):
+    """2026-10-22: the group list lives in groups.txt at the project root and is read on every run."""
+    f = tmp_path / "groups.txt"
+    f.write_text("\ufeff" + lines("# comment", "", "https://www.facebook.com/groups/111/", "222",
+                                  "- https://www.facebook.com/groups/some.name/?ref=share   # inline note",
+                                  "https://www.facebook.com/groups/111"), encoding="utf-8")
+    monkeypatch.setattr(scraper, "GROUPS_FILE", f)
+    args = parse(monkeypatch, *LIMITS)
+    assert args.group == ["https://www.facebook.com/groups/111/", "https://www.facebook.com/groups/222/",
+                          "https://www.facebook.com/groups/some.name/?ref=share"]
+    assert "3 جروب من" in capsys.readouterr().err
+
+
+def test_groups_file_option_overrides_default(monkeypatch, tmp_path):
+    f = tmp_path / "other.md"
+    f.write_text(lines("# list", "- 333"), encoding="utf-8")
+    monkeypatch.setattr(scraper, "GROUPS_FILE", tmp_path / "missing.txt")
+    assert parse(monkeypatch, *LIMITS, "--groups-file", str(f)).group == ["https://www.facebook.com/groups/333/"]
+
+
+def test_group_flag_wins_over_groups_file(monkeypatch, tmp_path):
+    f = tmp_path / "groups.txt"
+    f.write_text(lines("111"), encoding="utf-8")
+    monkeypatch.setattr(scraper, "GROUPS_FILE", f)
+    assert parse(monkeypatch, *BASE).group == ["https://www.facebook.com/groups/1"]
+
+
+@pytest.mark.parametrize("content, message", [
+    (None, "مفيش --group ومفيش ملف جروبات"),
+    (lines("# only comments", ""), "ملف الجروبات فاضي"),
+    (lines("111", "https://www.facebook.com/SomeNewsPage"), "سطر 2: مش رابط جروب"),
+])
+def test_groups_file_problems_stop_with_reason(monkeypatch, tmp_path, content, message):
+    f = tmp_path / "groups.txt"
+    if content is not None:
+        f.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(scraper, "GROUPS_FILE", f)
+    with pytest.raises(SystemExit) as exc:
+        parse(monkeypatch, *LIMITS)
+    assert message in str(exc.value)
+
+
+def test_groups_file_default_is_project_root():
+    assert scraper.GROUPS_FILE == ROOT / "groups.txt"
+
+
+def test_example_groups_file_parses():
+    assert len(scraper.read_groups_file(ROOT / "groups.example.txt")) == 3
+
+
 # ---------------------------------------------------------------- parse_args
 
 def parse(monkeypatch, *argv):
@@ -459,7 +518,7 @@ def test_parse_args_rejects_batch_size_below_1(monkeypatch, size):
     assert "batch-size" in str(exc.value)
 
 
-@pytest.mark.parametrize("missing", ["--group", "--min-posts", "--max-posts", "--min-comments", "--max-comments"])
+@pytest.mark.parametrize("missing", ["--min-posts", "--max-posts", "--min-comments", "--max-comments"])
 def test_parse_args_required(monkeypatch, missing, capsys):
     argv = list(BASE)
     i = argv.index(missing)

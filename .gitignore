@@ -38,3 +38,7 @@ desktop.ini
 .coverage
 .coverage.*
 htmlcov/
+
+# قايمة الجروبات الحقيقية: معرفات جروبات (الريبو عام) — groups.example.txt هو اللي بيترفع
+# Real scrape targets (group ids; public repo) — groups.example.txt is the committed template
+groups.txt

@@ -1,0 +1,9 @@
+# انسخ الملف ده لـ groups.txt وحط فيه جروباتك. groups.txt مش بيترفع على git (الريبو عام).
+# Copy to groups.txt and list your groups there. groups.txt is git-ignored (the repo is public).
+#
+# سطر لكل جروب: رابط كامل أو الـ id بس. السطور الفاضية و # بتتجاهل، والمكرر بيتشال.
+# One group per line: full URL or the numeric id. Blank lines and # comments are ignored; duplicates dropped.
+
+https://www.facebook.com/groups/1111111111111111/
+2222222222222222
+https://www.facebook.com/groups/some.group.name/   # تعليق في آخر السطر مسموح

@@ -92,7 +92,8 @@ python -m venv .venv
 .venv\Scripts\python.exe -m playwright install chromium
 
 .\start-cdp-browser.cmd                      # افتح المتصفح، وسجّل دخول فيسبوك مرة واحدة
-.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL --min-posts 1 --max-posts 5 --min-comments 1 --max-comments 30
+.venv\Scripts\python.exe fb_groups_to_sheet.py --min-posts 1 --max-posts 7 --min-comments 0 --max-comments 20   # الجروبات من groups.txt
+.venv\Scripts\python.exe fb_groups_to_sheet.py --group URL --min-posts 1 --max-posts 5 --min-comments 1 --max-comments 30   # جروب بعينه
 .venv\Scripts\python.exe fb_return_replies.py
 ```
 
@@ -155,6 +156,13 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
 ---
 
 ## سجل التحديثات
+
+### 2026-10-22 — قايمة الجروبات في `groups.txt`
+- **`groups.txt` في فولدر المشروع** بقى مصدر الجروبات: من غير `--group`، السحب بيقرا الملف ده في كل تشغيل
+  (`--groups-file` لملف تاني، و `--group` لسه بيكسب لو اتكتب). سطر لكل جروب: رابط أو id بس؛ الفاضي و `#`
+  بيتجاهلوا، و «- » بتاعة markdown مقبولة، والمكرر بيتشال، وأي سطر مش جروب بيوقف التشغيل برقم السطر.
+  **ليه:** صاحب المشروع هيسحب 50+ جروب، وقايمة بالطول ده مكانها ملف مش سطر أوامر.
+- **`groups.txt` مستبعد من git** (معرفات جروبات حقيقية والريبو عام)؛ `groups.example.txt` هو القالب اللي بيترفع.
 
 ### 2026-10-22 — تشغيل الردود التاني بعد الإصلاحات: 3/3 اتنشروا
 - بعد preflight كامل (56/58، الفشلين الجروب الخاص بس) وبكل التشخيص: الـ 3 ردود اتنشروا، كل واحد تحت التعليق
