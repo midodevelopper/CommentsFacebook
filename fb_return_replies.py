@@ -117,6 +117,41 @@ def expand_thread(page, comment_id: str) -> int:
     )
 
 
+def target_shown(page, comment_id: str) -> bool:
+    return bool(page.evaluate("(commentId) => {" + THREAD_JS + "return !!findTarget(commentId); }", comment_id))
+
+
+# لفّات «عرض المزيد» + تمرير بالكتير، لما التعليق الهدف مش ظاهر في أول الصفحة
+TARGET_ROUNDS = 25
+
+
+def bring_target_into_page(page, comment_id: str) -> bool:
+    """التعليق الهدف ممكن مايبانش: فيسبوك بيفتح المنشور على «الأكثر ملاءمة» وبيخبّي الباقي (تشغيل الردود
+    التالت 2026-10-22: منشور فيه 29 تعليق والظاهر 2 بس، فالرد رجع no-comment). بنعرض المخفي، ونختار
+    «الأحدث»، ونفتح «عرض المزيد» ونمرّر لحد ما يظهر. كله قراءة: مفيش كتابة."""
+    if target_shown(page, comment_id):
+        return True
+    import fb_groups_to_sheet as scraper  # نفس دوال الفتح والفرز اللي السحب بيستخدمها
+
+    scraper.reveal_hidden_comments(page)
+    if target_shown(page, comment_id):
+        return True
+    try:
+        scraper.close_open_menu(page)
+        scraper.sort_comments_newest(page)
+    except Exception:
+        pass  # من غير فرز لسه ممكن نلاقيه بالتمرير
+    for _ in range(TARGET_ROUNDS):
+        if target_shown(page, comment_id):
+            return True
+        clicked = scraper.expand_comments(page, rounds=1)
+        moved = scraper.scroll_comment_pane(page)
+        page.wait_for_timeout(600)
+        if not clicked and not moved:
+            break
+    return target_shown(page, comment_id)
+
+
 def wait_for_reply(page, comment_id: str, reply: str, me: str, timeout_ms: int = CONFIRM_MS) -> bool:
     waited = 0
     while waited <= timeout_ms:
@@ -136,6 +171,8 @@ def post_one(page, item: dict) -> str:
     comment_id = str(item["comment_id"])
     reply = item["reply"]
     me = own_user_id(page)
+    if not bring_target_into_page(page, comment_id):
+        return "no-comment"
     # تشغيل قبل كده ممكن يكون نشر الرد ومالحقش يعلّمه (أو مااتأكدش منه): مانكررش الرد
     if expand_thread(page, comment_id):
         page.wait_for_timeout(1500)
@@ -152,7 +189,10 @@ def post_one(page, item: dict) -> str:
           // نعلّم الصناديق الموجودة قبل الضغط: صندوق جديد بعده هو الأولى (بس مش شرط: شوف تحت)
           document.querySelectorAll('[data-hermes-article]').forEach(e => e.removeAttribute('data-hermes-article'));
           document.querySelectorAll('[data-hermes-target]').forEach(e => e.removeAttribute('data-hermes-target'));
-          document.querySelectorAll('[role="textbox"]').forEach(b => b.setAttribute('data-hermes-before', '1'));
+          document.querySelectorAll('[role="textbox"]').forEach(b => {
+            b.setAttribute('data-hermes-before', '1');
+            b.setAttribute('data-hermes-was', norm(b.textContent));
+          });
           article.setAttribute('data-hermes-article', '1');
           button.click();
           return 'opened';
@@ -164,6 +204,9 @@ def post_one(page, item: dict) -> str:
     # صندوق الرد: بعد التعليق الهدف وجوه نفس الـ thread (مفيش تعليق من thread تاني بينهم)، ومش صندوق
     # التعليق العام. فيسبوك ساعات بيبقى راسمه قبل الضغط وبيحط فيه المنشن بس (اتشاف في تشغيل حقيقي
     # 2026-10-22)، فالجديد أولى بس القديم مقبول. والظاهر أولى من المخفي.
+    # الأولى من الكل: الصندوق اللي نصه اتغير بالضغطة = اللي فيسبوك حط فيه المنشن. في تشغيل الردود التالت
+    # الـ thread كان فيه رد متداخل له صندوق مرسوم قبل كده، والكود أخد أول صندوق ظاهر (بتاع الرد المتداخل)
+    # والمنشن كان في التاني — فالرد نزل على الشخص الغلط.
     find_box = r"""(pub) => {""" + THREAD_JS + r"""
       const article = document.querySelector('[data-hermes-article]');
       if (!article) return false;
@@ -176,7 +219,9 @@ def post_one(page, item: dict) -> str:
         (article.contains(b) || follows(article, b)) && !pubRe.test(label(b))
         && !others.some(a => follows(a, b)));
       const visible = b => b.getClientRects().length > 0;
-      const pick = [b => !b.hasAttribute('data-hermes-before') && visible(b), visible,
+      const mentioned = b => b.hasAttribute('data-hermes-was') && norm(b.textContent)
+        && norm(b.textContent) !== b.getAttribute('data-hermes-was');
+      const pick = [b => mentioned(b) && visible(b), b => !b.hasAttribute('data-hermes-before') && visible(b), visible,
                     b => !b.hasAttribute('data-hermes-before')]
         .map(f => boxes.find(f)).find(Boolean);
       if (!pick) return false;

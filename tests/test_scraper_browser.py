@@ -866,3 +866,49 @@ def test_goto_with_retry_gives_up_after_three(page, monkeypatch):
     with pytest.raises(PlaywrightTimeout):
         scraper.goto_with_retry(page, "https://www.facebook.com/groups/1/posts/2/")
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------- no sort control: complete set sorted by time (2026-10-22)
+
+def aged(*minutes):
+    """Top-level comments in page order, each «N د» old."""
+    digits = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+    return [Comment(id=str(900000000000100 + i), text=f"c{i}", time=f"{str(m).translate(digits)} د")
+            for i, m in enumerate(minutes)]
+
+
+def test_no_sort_control_but_all_comments_shown_is_sorted_newest_first(page, fake_fb, monkeypatch):
+    """Seen live: 2 comments shown, Facebook's counter says 2, no sort button. The set is complete,
+    so it is kept and ordered newest-first by time instead of being skipped."""
+    cs = aged(20, 3, 10)
+    monkeypatch.setattr(scraper, "comment_total", lambda p: 3)
+    out = scrape(page, fake_fb, Post("77", comments=cs, sort_mode="none", no_comments_text=False))
+    assert out["comment_sort"] == scraper.COMPLETE_BY_TIME and not out.get("unavailable")
+    assert [c["text"] for c in out["comments"]] == ["c1", "c2", "c0"]
+
+
+def test_no_sort_control_with_fewer_comments_than_the_counter_is_still_skipped(page, fake_fb, monkeypatch):
+    monkeypatch.setattr(scraper, "comment_total", lambda p: 5)
+    out = scrape(page, fake_fb, Post("77", comments=aged(1, 2, 3), sort_mode="none", no_comments_text=False))
+    assert out["comment_sort"] == scraper.SORT_SKIPPED and out["comments"] == []
+    assert (out["comments_expected"], out["comments_seen"]) == (5, 3)
+
+
+def test_no_sort_control_without_a_counter_is_skipped(page, fake_fb, monkeypatch):
+    monkeypatch.setattr(scraper, "comment_total", lambda p: None)
+    out = scrape(page, fake_fb, Post("77", comments=aged(1, 2), sort_mode="none", no_comments_text=False))
+    assert out["comment_sort"] == scraper.SORT_SKIPPED
+
+
+def test_no_sort_control_with_a_limit_keeps_the_newest_not_the_first_shown(page, fake_fb, monkeypatch):
+    monkeypatch.setattr(scraper, "comment_total", lambda p: 4)
+    out = scrape(page, fake_fb, Post("77", comments=aged(30, 20, 2, 5), sort_mode="none", no_comments_text=False),
+                 max_c=2)
+    assert [c["text"] for c in out["comments"]] == ["c2", "c3"]
+
+
+def test_collect_reloads_an_empty_feed_once_before_giving_up(page, fake_fb):
+    fake_fb.add_group(Group(G, sort_label="غير ذلك"))
+    scraper.collect_post_ids(page, G, 5)
+    feeds = [u for u in fake_fb.navigations() if "sorting_setting=CHRONOLOGICAL" in u]
+    assert len(feeds) == scraper.FEED_ATTEMPTS == 2

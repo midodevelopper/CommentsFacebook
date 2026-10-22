@@ -404,17 +404,40 @@ def feed_post_ids(page, group_id: str) -> list[str]:
     return ids
 
 
+# موجز فاضي بيتعاد تحميله مرة: في RUN6 جروب نشط (17.5 ألف عضو، منشور من 16 دقيقة) طلع 0 منشورات لأن الموجز
+# ماترسمش في الوقت والـ CPU عند 100% مع 4 نوافذ — وبعدها بشوية نفس الصفحة كان فيها منشورات عادي
+FEED_ATTEMPTS = 2
+
+
 def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
-    page.goto(
-        f"https://www.facebook.com/groups/{group_id}?sorting_setting=CHRONOLOGICAL",
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
-    # الموجز بيترسم بعد DOMContentLoaded: لحد ما يظهر منشور من الجروب أو يبان إنه خاص (4 ث بالكتير زي الأول)
-    wait_until(page, lambda: bool(feed_post_ids(page, group_id)) or group_is_private_for_us(page), 4000)
-    if group_is_private_for_us(page):
-        print(f"الجروب {group_id} خاص والحساب مش عضو فيه — مفيش منشورات نقدر نشوفها", file=sys.stderr)
-        return [], ""
+    for attempt in range(1, FEED_ATTEMPTS + 1):
+        page.goto(
+            f"https://www.facebook.com/groups/{group_id}?sorting_setting=CHRONOLOGICAL",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        # الموجز بيترسم بعد DOMContentLoaded: لحد ما يظهر منشور من الجروب أو يبان إنه خاص (4 ث بالكتير زي الأول)
+        wait_until(page, lambda: bool(feed_post_ids(page, group_id)) or group_is_private_for_us(page), 4000)
+        if group_is_private_for_us(page):
+            print(f"الجروب {group_id} خاص والحساب مش عضو فيه — مفيش منشورات نقدر نشوفها", file=sys.stderr)
+            return [], ""
+        if not feed_post_ids(page, group_id) and post_unavailable(page):
+            # «هذا المحتوى غير متوفر حاليًا» على صفحة الجروب نفسها: اتمسح أو اتخفى عن الحساب — مفيش لازمة نعيد
+            print(f"الجروب {group_id} مش متاح (فيسبوك: «هذا المحتوى غير متوفر حاليًا») — اتمسح أو اتخفى عن الحساب",
+                  file=sys.stderr)
+            return [], ""
+        ids, label = _scroll_feed(page, group_id, max_posts)
+        if ids:
+            return ids, label
+        if attempt < FEED_ATTEMPTS:
+            print(f"موجز الجروب {group_id} طلع فاضي — بنعيد تحميله (محاولة {attempt + 1})", file=sys.stderr)
+    # جروب مش موجود كان بيخلص بـ 0 منشورات من غير ما يقول حاجة (اتشاف في تشغيل حقيقي)
+    print(f"موجز الجروب {group_id} مافيهوش ولا منشور ظاهر — الجروب مش موجود أو فاضي أو مش متاح للحساب",
+          file=sys.stderr)
+    return [], label
+
+
+def _scroll_feed(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
     # textContent مش innerText: innerText بيجبر layout على كل زرار، وده أخد 18 ثانية على فيسبوك
     label = page.evaluate(
         """() => {
@@ -439,10 +462,6 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
         page.mouse.wheel(0, 2200)
         # لحد ما منشور جديد يترسم (1.8 ث بالكتير زي الأول)
         wait_until(page, lambda: any(p not in ids for p in feed_post_ids(page, group_id)), 1800)
-    if not ids:
-        # جروب مش موجود كان بيخلص بـ 0 منشورات من غير ما يقول حاجة (اتشاف في تشغيل حقيقي)
-        print(f"موجز الجروب {group_id} مافيهوش ولا منشور ظاهر — الجروب مش موجود أو فاضي أو مش متاح للحساب",
-              file=sys.stderr)
     return ids[:max_posts], label
 
 
@@ -568,6 +587,61 @@ POST_READY_JS = "(p) => {" + POST_ROOT_JS + r"""
 }"""
 
 
+HIDDEN_COMMENTS_JS = r"عرض التعليقات المخفية|View hidden comments|See hidden comments"
+# عداد التعليقات = الرقم جوه زرار «كتابة تعليق» تحت المنشور (اتشاف في صفحات حقيقية 2026-10-22)
+COMMENT_COUNTER_CSS = ("[role='button'][aria-label='كتابة تعليق'], [role='button'][aria-label='Leave a comment'], "
+                       "[role='button'][aria-label='Comment']")
+ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def reveal_hidden_comments(page) -> int:
+    """يضغط «عرض التعليقات المخفية» (تعليقات فيسبوك أو الأدمن خبّاها). عرض بس، مفيش كتابة.
+
+    اتشاف في RUN6: منشور كل تعليقاته مخفية = مفيش ولا تعليق مرسوم ولا زرار فرز، فالجروب كله كان بيقف.
+    """
+    before = comment_count(page)
+    clicked = int(page.evaluate(
+        "(pattern) => {" + POST_ROOT_JS + r"""
+          const re = new RegExp(pattern);
+          const buttons = [...postRoot().querySelectorAll('[role="button"]')]
+            .filter(b => re.test((b.textContent || '').replace(/\s+/g, ' ').trim()));
+          buttons.forEach(b => b.click());
+          return buttons.length;
+        }""", HIDDEN_COMMENTS_JS))
+    if clicked:
+        wait_until(page, lambda: comment_count(page) > before, 2500)
+    return clicked
+
+
+def comment_total(page) -> int | None:
+    """عدد التعليقات اللي فيسبوك كاتبه تحت المنشور (بالردود). None لو مش ظاهر أو مختصر («1.2 ألف»)."""
+    text = page.evaluate(
+        "(css) => {" + POST_ROOT_JS + r"""
+          const b = postRoot().querySelector(css);
+          return b ? (b.textContent || '').trim() : null;
+        }""", COMMENT_COUNTER_CSS)
+    if text is None:
+        return None
+    digits = text.translate(ARABIC_DIGITS).strip()
+    return int(digits) if digits.isdigit() else None
+
+
+def newest_first_threads(comments: list[dict]) -> list[dict]:
+    """ترتيب «الأحدث» بإيدنا لما فيسبوك مايديناش زرار فرز: التعليقات بالوقت الكامل (الأحدث فوق)،
+    وكل رد تحت تعليقه بنفس ترتيبه. الوقت المتساوي بيفضل بترتيب الصفحة."""
+    replies: dict[str, list[dict]] = {}
+    for c in comments:
+        if c["is_reply"]:
+            replies.setdefault(c["parent_id"], []).append(c)
+    ordered: list[dict] = []
+    for top in sorted((c for c in comments if not c["is_reply"]), key=lambda c: c["created_time"], reverse=True):
+        ordered.append(top)
+        ordered += replies.pop(top["comment_id"], [])
+    for rest in replies.values():  # ردود تعليقها نفسه مش ظاهر
+        ordered += rest
+    return ordered
+
+
 # من غير \b: في JavaScript الحروف العربي مش «word»، فـ \b بعد «الأحدث» عمره ما يطابق
 SORT_BUTTON_JS = r"^(الأكثر ملاءمة|كل التعليقات|الأحدث|Most relevant|All comments|Newest)"
 
@@ -641,7 +715,7 @@ def expand_comments(page, rounds: int = 30) -> int:
         clicked = page.evaluate(
             r"""() => {""" + POST_ROOT_JS + r"""
               const root = postRoot();
-              const wanted = /عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|View more comments|View previous comments|View more replies|View all \d+ replies|View \d+ repl/;
+              const wanted = /عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|عرض التعليقات المخفية|View more comments|View previous comments|View more replies|View all \d+ replies|View \d+ repl|View hidden comments|See hidden comments/;
               const buttons = [...root.querySelectorAll('[role="button"]')].filter(e => {
                 const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
                 return t && t !== 'رد' && t !== 'Reply' && wanted.test(t);
@@ -661,7 +735,7 @@ def expand_comments(page, rounds: int = 30) -> int:
             more = lambda: bool(page.evaluate(  # noqa: E731
                 r"""() => {""" + POST_ROOT_JS + r"""
                   const root = postRoot();
-                  const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|View more comments|View .*repl/;
+                  const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|عرض التعليقات المخفية|View more comments|View .*repl|View hidden comments|See hidden comments/;
                   return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.textContent || '').replace(/\s+/g, ' ').trim()));
                 }"""
             ))
@@ -878,6 +952,8 @@ def richer_header(snap: dict, header: dict) -> bool:
 
 
 SORT_SKIPPED = "sort-unavailable"
+# مفيش زرار فرز، بس كل التعليقات ظاهرة (العدد = عداد فيسبوك)، فاترتّبت «الأحدث» بالوقت الكامل بإيدنا
+COMPLETE_BY_TIME = "complete-by-time"
 
 
 def unavailable_post(group_id: str, post_id: str, url: str, reason: str = "unavailable") -> dict:
@@ -921,7 +997,10 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
         page.bring_to_front()
     # بدل 2.5 ث ثابتة: لحد ما المنشور يترسم (4 ث بالكتير = 2.5 هنا + 1.5 اللي كانت في أول الفرز)
     wait_until(page, lambda: post_ready(page), 4000)
+    # قبل الفرز: التعليقات المخفية بتتعرض الأول، عشان العدّ والفرز يشوفوا كل التعليقات
+    reveal_hidden_comments(page)
     sort_state = "missing"
+    unsorted = False
     for _ in range(3):
         close_open_menu(page)
         try:
@@ -944,12 +1023,17 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             gone = False
         if gone:
             return unavailable_post(group_id, post_id, url)
-        # مفيش زرار فرز خالص والمنشور فيه تعليقين ظاهرين أو أكتر (اتشاف 2026-10-22): الترتيب مش مضمون والعرض
-        # الافتراضي ممكن يخبّي تعليق، فالمنشور بيتعدّى من غير صف بدل ما الجروب كله يقف (قرار صاحب المشروع).
+        # مفيش زرار فرز خالص والمنشور فيه تعليقين ظاهرين أو أكتر (اتشاف 2026-10-22): بنسحب كل التعليقات، ولو
+        # عددهم وصل لعداد فيسبوك تحت المنشور يبقى ماحدش مستخبي، فبنرتّبهم «الأحدث» بإيدنا بالوقت الكامل.
+        # لو أقل من العداد (العرض الافتراضي خبّى حاجة) المنشور بيتعدّى من غير صف (قرار صاحب المشروع).
         # صفحة مااترسمتش (مفيش ولا تعليق ظاهر) لسه بتوقف: ده ممكن يبقى تسجيل خروج أو checkpoint.
         if sort_state == "missing" and distinct_comment_ids(page) >= 2:
-            return unavailable_post(group_id, post_id, url, reason=SORT_SKIPPED)
-        raise SystemExit(f"فرز التعليقات مش «الأحدث» على المنشور {post_id}: {sort_state}")
+            unsorted = True
+        else:
+            raise SystemExit(f"فرز التعليقات مش «الأحدث» على المنشور {post_id}: {sort_state}")
+    # من غير فرز: لازم نشوف كل التعليقات قبل ما نرتّب ونقص لحد max_comments، وإلا ناخد أول N بترتيب غلط
+    limit = NO_LIMIT if unsorted else max_comments
+    stream = None if unsorted else on_batch
     seen: dict[str, dict] = {}
     order: list[str] = []
     pending: list[dict] = []
@@ -963,7 +1047,7 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     # لقطة واحدة ماكانتش كفاية (D-36)، و 3 كمان لأ: فيديو من غير وصف اترسم بعد أكتر من 3 ثواني (D-41).
     no_comments = sort_state in NO_COMMENT_STATES
     for round_no in range(HEADER_ROUNDS if no_comments else 400):
-        if len(order) >= max_comments:
+        if len(order) >= limit:
             break
         if no_comments and round_no:
             page.wait_for_timeout(1000)
@@ -985,17 +1069,17 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             comment = normalize_comment(raw, group_id, post_id)
             if not comment or comment["comment_id"] in seen:
                 continue
-            if len(order) >= max_comments:
+            if len(order) >= limit:
                 break
             seen[comment["comment_id"]] = comment
             order.append(comment["comment_id"])
             pending.append(comment)
             added += 1
-        while on_batch and len(pending) >= batch_size:
+        while stream and len(pending) >= batch_size:
             batch = pending[:batch_size]
             del pending[:batch_size]
             batch_index += 1
-            on_batch(batch, batch_index, False)
+            stream(batch, batch_index, False)
         if no_comments:
             # أول لقطة بقت بدري (من غير الانتظار الثابت)، فالنوع لوحده مش كفاية: صاحب المنشور ووقته كمان
             if header.get("content_kind") and header.get("author") and header.get("created_time"):
@@ -1014,7 +1098,19 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
         # (5 لفّات فاضية أخدت ~150 ثانية على منشور واحد في تشغيل حقيقي)
         if stale >= 5 or (stale >= 2 and not expanded and not moved):
             break
-    if on_batch and pending:
+    if unsorted:
+        total = comment_total(page)
+        if total is None or len(order) < total:
+            skipped = unavailable_post(group_id, post_id, url, reason=SORT_SKIPPED)
+            skipped.update(comments_expected=total, comments_seen=len(order))
+            return skipped
+        order = [c["comment_id"] for c in newest_first_threads([seen[cid] for cid in order])][:max_comments]
+        sort_state = COMPLETE_BY_TIME
+        pending = [seen[cid] for cid in order] if on_batch else []
+        for i in range(0, len(pending), batch_size):
+            batch_index += 1
+            on_batch(pending[i:i + batch_size], batch_index, i + batch_size >= len(pending))
+    elif on_batch and pending:
         batch_index += 1
         on_batch(pending, batch_index, True)
     comments = [seen[cid] for cid in order]

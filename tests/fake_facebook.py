@@ -62,6 +62,11 @@ class Post:
     # live 2026-10-22: the reply composer («اكتب ردًا عامًا...») already exists before Reply is clicked,
     # and the click fills in an @mention of the comment's author
     reply_box_prerendered: bool = False
+    # live reply run 3 (2026-10-22): a nested sub-thread inside the target's thread had its own VISIBLE, empty
+    # reply composer right after the target — before the target's own box, which got the @mention
+    nested_box_first: bool = False
+    # live reply run 3: the ?comment_id= permalink did NOT bring the target into view (2 of 29 shown)
+    permalink_focus: bool = True
     mention: bool = True
     # live 2026-10-22: a non-empty composer makes leaving the page raise a beforeunload dialog
     draft_guard: bool = True
@@ -218,7 +223,7 @@ function render() {
   if (D.virtualize) visible = visible.slice(-D.virtualize);
   // a ?comment_id= permalink brings that comment (and its reply thread) into view, like Facebook
   const focus = new URLSearchParams(location.search).get('comment_id');
-  const focused = focus && all.find(c => c.id === focus);
+  const focused = focus && D.permalink_focus && all.find(c => c.id === focus);
   if (focused && !visible.includes(focused)) visible = [focused, ...visible];
   if (focused && new URLSearchParams(location.search).get('reply_comment_id')) open.add(focused.id);
   const list = el('div', {class: 'comments'});
@@ -249,6 +254,10 @@ function render() {
       while (after.nextElementSibling && after.nextElementSibling.classList.contains('replies')) after = after.nextElementSibling;
       after.after(box);
     }
+  }
+  if (D.nested_box_first && visible.length) {
+    const target = list.querySelector(`[role=article][data-cid="${visible[0].id}"]`);
+    target.after(composer(visible[0].id + '-nested', 'reply'));
   }
   host.append(list);
   if (D.comments_off) host.append(el('div', {}, EN ? 'Commenting has been turned off for this post.' : 'تم إيقاف تشغيل التعليقات لهذا المنشور من قبل صاحبه.'));

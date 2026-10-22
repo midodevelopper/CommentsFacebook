@@ -1127,3 +1127,37 @@ def test_archive_group_lists_sort_skipped_posts_without_sending_them(flow, monke
     assert out["posts_sort_skipped"] == ["11"] and out["posts_unavailable"] == []
     assert [p["post_id"] for p in out["posts"]] == ["12"]
     assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["12"]
+
+
+# ---------------------------------------------------------------- no sort control helpers (2026-10-22)
+
+def c(cid, time, reply_of=""):
+    return {"comment_id": cid, "created_time": time, "is_reply": bool(reply_of), "parent_id": reply_of}
+
+
+def test_newest_first_threads_orders_top_level_by_time_and_keeps_replies_under_their_comment():
+    ordered = scraper.newest_first_threads([
+        c("1", "2026-10-22 10:00"), c("1r", "2026-10-22 12:00", reply_of="1"),
+        c("2", "2026-10-22 11:00"), c("3", "2026-10-22 09:00"), c("2r", "2026-10-22 11:30", reply_of="2"),
+    ])
+    assert [x["comment_id"] for x in ordered] == ["2", "2r", "1", "1r", "3"]
+
+
+def test_newest_first_threads_keeps_orphan_replies_and_ties_in_page_order():
+    ordered = scraper.newest_first_threads([c("a", "2026-10-22 10:00"), c("b", "2026-10-22 10:00"),
+                                            c("x", "2026-10-22 09:00", reply_of="gone")])
+    assert [x["comment_id"] for x in ordered] == ["a", "b", "x"]
+
+
+class CounterPage:
+    def __init__(self, text):
+        self.text = text
+
+    def evaluate(self, script, arg=None):
+        return self.text
+
+
+@pytest.mark.parametrize("text, total", [("٦", 6), ("12", 12), ("١٥", 15), (None, None), ("1.2 ألف", None),
+                                         ("1.2K", None), ("", None)])
+def test_comment_total_reads_exact_counts_only(text, total):
+    assert scraper.comment_total(CounterPage(text)) == total

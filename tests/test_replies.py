@@ -691,3 +691,33 @@ def test_post_one_reply_glued_to_mention_is_not_sent(page, fake_fb, monkeypatch)
     post = setup_post(fake_fb)
     assert replies.post_one(page, item(post.comments[0].id, "شكرا")) == "typing-failed"
     assert sent(page) == []
+
+
+# ---------------------------------------------------------------- reply run 3 fixes (2026-10-22)
+
+@pytest.mark.browser
+def test_post_one_uses_the_box_that_received_the_mention_not_the_first_visible(page, fake_fb):
+    """Reply run 3: a visible empty composer of a nested sub-thread sat right after the target; the reply went
+    into it (Facebook showed it as a reply to someone else). The box the click filled with the mention wins."""
+    post = setup_post(fake_fb, reply_box_prerendered=True, nested_box_first=True, composer="bottom")
+    target = post.comments[0]
+    assert replies.post_one(page, item(target.id, "تمام")) == "posted"
+    assert sent(page) == [{"comment_id": target.id, "text": f"{target.author} تمام",
+                           "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={target.id}"}]
+    assert page.evaluate(f"document.querySelector('[data-for=\"{target.id}-nested\"]').textContent") == ""
+
+
+@pytest.mark.browser
+def test_post_one_finds_a_target_beyond_the_first_page_of_comments(page, fake_fb):
+    """Reply run 3: the post opened with 2 of 29 comments shown and the target was not among them (no-comment)."""
+    cs = comments(4)
+    setup_post(fake_fb, cs=cs, page_size=1, permalink_focus=False)
+    assert replies.post_one(page, item(cs[3].id, "أهلًا")) == "posted"
+    assert sent(page)[0]["comment_id"] == cs[3].id
+
+
+@pytest.mark.browser
+def test_post_one_still_no_comment_when_the_target_is_really_gone(page, fake_fb):
+    setup_post(fake_fb, page_size=1)
+    assert replies.post_one(page, item("123456789")) == "no-comment"
+    assert sent(page) == []
