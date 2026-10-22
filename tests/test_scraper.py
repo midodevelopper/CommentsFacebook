@@ -588,7 +588,8 @@ def test_archive_group_return_contract(flow):
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 2, 5, 1, 10)
     assert list(out.keys()) == ["token", "group_id", "group_url", "group_name", "sort_posts",
                                 "feed_sort_label", "sort_comments", "limits", "posts_found",
-                                "posts_shortfall", "posts", "posts_unavailable"]   # + D-33: skipped deleted posts
+                                "posts_shortfall", "posts", "posts_unavailable",   # + D-33: skipped deleted posts
+                                "posts_sort_skipped"]                               # + no sort control, 2+ comments
     assert out["token"] == scraper.TOKEN
     assert out["group_url"] == f"https://www.facebook.com/groups/{G}"
     assert out["sort_posts"] == "CHRONOLOGICAL" and out["sort_comments"] == "الأحدث"
@@ -1100,3 +1101,19 @@ def test_archive_group_hands_sheet_payloads_to_the_sender(flow):
     assert calls["sheet"] == []                                       # nothing sent on the scraping thread
     assert [p["posts"][0]["post_id"] for p in sender.payloads] == ["11", "12"]
     assert [p["sheet_batches"] for p in out["posts"]] == [1, 1]
+
+
+def test_archive_group_lists_sort_skipped_posts_without_sending_them(flow, monkeypatch):
+    calls, data = flow
+    data.update({"11": 2, "12": 1})
+    real = scraper.scrape_post
+
+    def scrape(page, group_id, post_id, *a, **k):
+        if post_id == "11":
+            return scraper.unavailable_post(group_id, post_id, "u", reason=scraper.SORT_SKIPPED)
+        return real(page, group_id, post_id, *a, **k)
+    monkeypatch.setattr(scraper, "scrape_post", scrape)
+    out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10, dry=False)
+    assert out["posts_sort_skipped"] == ["11"] and out["posts_unavailable"] == []
+    assert [p["post_id"] for p in out["posts"]] == ["12"]
+    assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["12"]

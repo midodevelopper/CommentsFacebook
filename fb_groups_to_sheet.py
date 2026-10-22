@@ -874,11 +874,15 @@ def richer_header(snap: dict, header: dict) -> bool:
         or not header.get("post_content")
 
 
-def unavailable_post(group_id: str, post_id: str, url: str) -> dict:
+SORT_SKIPPED = "sort-unavailable"
+
+
+def unavailable_post(group_id: str, post_id: str, url: str, reason: str = "unavailable") -> dict:
+    """منشور مالوش صف في الشيت: اتمسح/اتخفى، أو (SORT_SKIPPED) مفيش طريقة نضمن بيها ترتيب «الأحدث»."""
     return {
         "group_id": group_id, "post_id": post_id, "permalink": url, "url": url, "unavailable": True,
         "author": "", "author_id": "", "author_url": "", "text": "", "post_content": "", "content_kind": "",
-        "media_url": "", "created_time": "", "created_time_raw": "", "comment_sort": "unavailable",
+        "media_url": "", "created_time": "", "created_time_raw": "", "comment_sort": reason,
         "comments_found": 0, "replies_found": 0, "comments_shortfall": False, "comments_over_max": False,
         "capture_mode": "incremental", "sheet_batches": 0, "comments": [],
     }
@@ -937,6 +941,11 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             gone = False
         if gone:
             return unavailable_post(group_id, post_id, url)
+        # مفيش زرار فرز خالص والمنشور فيه تعليقين ظاهرين أو أكتر (اتشاف 2026-10-22): الترتيب مش مضمون والعرض
+        # الافتراضي ممكن يخبّي تعليق، فالمنشور بيتعدّى من غير صف بدل ما الجروب كله يقف (قرار صاحب المشروع).
+        # صفحة مااترسمتش (مفيش ولا تعليق ظاهر) لسه بتوقف: ده ممكن يبقى تسجيل خروج أو checkpoint.
+        if sort_state == "missing" and distinct_comment_ids(page) >= 2:
+            return unavailable_post(group_id, post_id, url, reason=SORT_SKIPPED)
         raise SystemExit(f"فرز التعليقات مش «الأحدث» على المنشور {post_id}: {sort_state}")
     seen: dict[str, dict] = {}
     order: list[str] = []
@@ -1043,10 +1052,12 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
         name = ""
     posts = []
     unavailable: list[str] = []
+    sort_skipped: list[str] = []
 
     def result() -> dict:
         out = _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts)
         out["posts_unavailable"] = list(unavailable)
+        out["posts_sort_skipped"] = list(sort_skipped)
         return out
 
     for post_id in post_ids:
@@ -1077,9 +1088,13 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
             batch_size=batch_size,
         )
         if post.get("unavailable"):
-            # اتمسح/اتخفى: مالوش صف في الشيت، بس بيتسجّل في الدَمب
-            print(f"{group_id}/{post_id}: unavailable (اتمسح أو اتخفى) — اتعدّى")
-            unavailable.append(post_id)
+            # مالوش صف في الشيت، بس بيتسجّل في الدَمب
+            if post["comment_sort"] == SORT_SKIPPED:
+                print(f"{group_id}/{post_id}: {SORT_SKIPPED} (مفيش زرار فرز و2+ تعليق) — اتعدّى", flush=True)
+                sort_skipped.append(post_id)
+            else:
+                print(f"{group_id}/{post_id}: unavailable (اتمسح أو اتخفى) — اتعدّى")
+                unavailable.append(post_id)
             continue
         print(
             f"{group_id}/{post_id}: comments={post['comments_found']} "

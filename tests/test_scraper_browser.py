@@ -498,11 +498,24 @@ def test_scrape_post_skips_articles_without_comment_link(page, fake_fb):
     assert len([c for c in snap["comments"] if scraper.normalize_comment(c, G, "77")]) == 2
 
 
-@pytest.mark.parametrize("mode, state", [("none", "missing"), ("no-option", "no-option"), ("unverified", "unverified")])
+@pytest.mark.parametrize("mode, state", [("no-option", "no-option"), ("unverified", "unverified")])
 def test_scrape_post_refuses_when_newest_cannot_be_established(page, fake_fb, mode, state):
     with pytest.raises(SystemExit) as exc:
         scrape(page, fake_fb, Post("77", comments=comments(3), sort_mode=mode))
     assert str(exc.value) == f"فرز التعليقات مش «الأحدث» على المنشور 77: {state}"
+
+
+def test_scrape_post_skips_a_post_with_comments_but_no_sort_control(page, fake_fb):
+    """Owner decision 2026-10-22 (seen live: 2 comments shown, no sort button): skip the post, keep the group going."""
+    out = scrape(page, fake_fb, Post("77", comments=comments(3), sort_mode="none", no_comments_text=False))
+    assert out["unavailable"] is True and out["comment_sort"] == scraper.SORT_SKIPPED and out["comments"] == []
+
+
+def test_scrape_post_no_sort_control_and_no_comments_rendered_still_stops(page, fake_fb):
+    """A page that did not render (logged out, checkpoint) must not be skipped silently post after post."""
+    with pytest.raises(SystemExit) as exc:
+        scrape(page, fake_fb, Post("77", comments=[], sort_mode="none", no_comments_text=False))
+    assert str(exc.value).endswith(": missing")
 
 
 def test_scrape_post_sort_attempted_three_times_before_failing(page, fake_fb, monkeypatch):
