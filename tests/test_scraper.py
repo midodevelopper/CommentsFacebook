@@ -485,7 +485,7 @@ def test_parse_args_defaults(monkeypatch):
     assert (args.min_posts, args.max_posts, args.min_comments, args.max_comments) == (1, 5, 0, 30)
     assert args.cdp == scraper.CDP
     assert args.dry is False and args.debug is False and args.trace is False
-    assert args.batch_size == 80
+    assert args.batch_size == 200 and args.workers == 1
 
 
 def test_parse_args_multiple_groups_and_flags(monkeypatch):
@@ -579,7 +579,7 @@ def test_archive_group_dry_never_sends(flow):
     assert [s["post_id"] for s in calls["scrape"]] == ["11", "12"]
     assert all(s["on_batch"] is None for s in calls["scrape"])        # incremental batching is never used
     assert out["posts_found"] == 2 and out["posts_shortfall"] is False
-    assert calls["sleep"] == [1.5, 1.5]
+    assert calls["sleep"] == []                                      # no fixed pause between posts
 
 
 def test_archive_group_return_contract(flow):
@@ -715,7 +715,7 @@ def run_main(monkeypatch, *argv):
 
 
 def fake_archive(posts_by_group):
-    def archive(page, url, min_posts, max_posts, min_c, max_c, dry=True, batch_size=80, progress=None):
+    def archive(page, url, min_posts, max_posts, min_c, max_c, dry=True, batch_size=80, progress=None, sender=None):
         gid = scraper.group_key(url)
         return {"token": scraper.TOKEN, "group_id": gid, "posts": posts_by_group.get(gid, [])}
     return archive
@@ -970,3 +970,133 @@ def test_archive_group_skips_unavailable_posts(flow, monkeypatch):
     assert [p["post_id"] for p in out["posts"]] == ["11", "13"]
     assert out["posts_unavailable"] == ["12"]
     assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["11", "13"]
+
+
+# ---------------------------------------------------------------- speed: polling, background Sheet sender, workers
+
+class TickPage:
+    """page.wait_for_timeout بيعدّ الوقت بس، من غير انتظار حقيقي."""
+    def __init__(self):
+        self.waited = []
+
+    def wait_for_timeout(self, ms):
+        self.waited.append(ms)
+
+
+def test_wait_until_returns_as_soon_as_ready():
+    page, checks = TickPage(), iter([False, False, True])
+    assert scraper.wait_until(page, lambda: next(checks), 4000) is True
+    assert page.waited == [scraper.POLL_MS, scraper.POLL_MS]
+
+
+def test_wait_until_never_waits_longer_than_the_old_fixed_wait():
+    page = TickPage()
+    assert scraper.wait_until(page, lambda: False, 1100) is False
+    assert sum(page.waited) == 1100 and max(page.waited) <= scraper.POLL_MS
+
+
+def test_wait_until_ready_at_once_does_not_wait():
+    page = TickPage()
+    assert scraper.wait_until(page, lambda: True, 4000) is True and page.waited == []
+
+
+def test_max_comments_all_means_no_limit(monkeypatch):
+    args = parse(monkeypatch, "--group", "https://www.facebook.com/groups/1", "--min-posts", "1",
+                 "--max-posts", "20", "--min-comments", "0", "--max-comments", "all")
+    assert args.max_comments == scraper.NO_LIMIT
+
+
+def test_max_comments_rejects_words_other_than_all(monkeypatch):
+    with pytest.raises(SystemExit):
+        parse(monkeypatch, "--group", "https://www.facebook.com/groups/1", "--min-posts", "1",
+              "--max-posts", "20", "--min-comments", "0", "--max-comments", "many")
+
+
+def test_workers_cannot_combine_with_debug(monkeypatch):
+    with pytest.raises(SystemExit, match="workers 1"):
+        parse(monkeypatch, *BASE, "--workers", "4", "--debug")
+
+
+def test_child_args_run_one_group_in_a_new_window_with_the_same_limits(monkeypatch):
+    args = parse(monkeypatch, *BASE, "--workers", "3", "--dry", "--batch-size", "50")
+    cmd = scraper.child_args(args, "https://www.facebook.com/groups/7", "20261022-120000")
+    assert cmd[cmd.index("--group") + 1] == "https://www.facebook.com/groups/7" and cmd.count("--group") == 1
+    assert cmd[cmd.index("--max-posts") + 1] == "5" and cmd[cmd.index("--batch-size") + 1] == "50"
+    assert "--new-window" in cmd and "--dry" in cmd and "--workers" not in cmd
+    assert cmd[cmd.index("--run-stamp") + 1] == "20261022-120000"
+
+
+def sender_payload(post_id, n, group=G):
+    return scraper.sheet_post_payload(group, {"post_id": post_id}, [{"comment_id": f"{post_id}{i}"} for i in range(n)])
+
+
+def test_sheet_sender_merges_queued_posts_within_the_batch_size():
+    sender = scraper.SheetSender(batch_size=5)
+    merged = sender._merged([sender_payload("1", 2), sender_payload("2", 3), sender_payload("3", 1),
+                             sender_payload("4", 0, group="other")])
+    sender.close()
+    assert [[p["post_id"] for p in m["posts"]] for m in merged] == [["1", "2"], ["3"], ["4"]]
+    assert all(scraper.SheetSender._comments(m) <= 5 for m in merged)
+
+
+def test_sheet_sender_joins_chunks_of_the_same_post_into_one_entry():
+    """الشيت بياخد أول ظهور للمنشور في الطلب بس، فالتعليقات لازم تبقى في entry واحد."""
+    sender = scraper.SheetSender(batch_size=10)
+    merged = sender._merged([sender_payload("1", 2), sender_payload("1", 3)])
+    sender.close()
+    assert len(merged) == 1 and len(merged[0]["posts"]) == 1
+    assert len(merged[0]["posts"][0]["comments"]) == 5
+
+
+def test_sheet_sender_does_not_mutate_the_callers_payload():
+    first = sender_payload("1", 2)
+    sender = scraper.SheetSender(batch_size=10)
+    sender._merged([first, sender_payload("1", 3)])
+    sender.close()
+    assert len(first["posts"][0]["comments"]) == 2
+
+
+def test_sheet_sender_sends_everything_before_close_returns(monkeypatch):
+    sent = []
+    monkeypatch.setattr(scraper, "sheet_post", lambda payload: sent.append(payload) or '{"ok":true}')
+    sender = scraper.SheetSender(batch_size=3)
+    for i in range(5):
+        sender.put(sender_payload(str(i), 2))
+    sender.close()
+    assert sorted(c["comment_id"] for p in sent for post in p["posts"] for c in post["comments"]) == \
+        sorted(f"{i}{j}" for i in range(5) for j in range(2))
+    assert all(scraper.SheetSender._comments(p) <= 3 for p in sent)
+
+
+def test_sheet_sender_failure_stops_the_scrape(monkeypatch):
+    def refuse(payload):
+        raise SystemExit("الشيت رفض البيانات")
+    monkeypatch.setattr(scraper, "sheet_post", refuse)
+    sender = scraper.SheetSender(batch_size=3)
+    sender.put(sender_payload("1", 1))
+    with pytest.raises(SystemExit, match="الشيت رفض"):
+        sender.close()
+    with pytest.raises(SystemExit, match="الإرسال للشيت وقف"):
+        sender.put(sender_payload("2", 1))
+
+
+def test_archive_group_hands_sheet_payloads_to_the_sender(flow):
+    calls, data = flow
+    data.update({"11": 3, "12": 0})
+
+    class Sender:
+        def __init__(self):
+            self.payloads = []
+
+        def put(self, payload):
+            self.payloads.append(payload)
+
+        def raise_if_failed(self):
+            pass
+
+    sender = Sender()
+    out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10,
+                                dry=False, sender=sender)
+    assert calls["sheet"] == []                                       # nothing sent on the scraping thread
+    assert [p["posts"][0]["post_id"] for p in sender.payloads] == ["11", "12"]
+    assert [p["sheet_batches"] for p in out["posts"]] == [1, 1]

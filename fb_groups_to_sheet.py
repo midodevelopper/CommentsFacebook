@@ -21,8 +21,11 @@ import datetime as dt
 import html
 import json
 import os
+import queue
 import re
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -266,6 +269,106 @@ def sheet_post(payload: dict) -> str:
     raise AssertionError("unreachable")
 
 
+class SheetSender:
+    """بيبعت للشيت في thread جنبي، فالسحب مابيستناش Apps Script (4–9 ث للطلب في تشغيلات حقيقية).
+
+    اللي مستني في الطابور بيتجمع في طلب واحد (نفس الجروب، لحد batch_size تعليق و MAX_POSTS منشور)،
+    فعدد الطلبات بيقل كمان. الترتيب محفوظ والشيت upsert بالـ id، فالتجميع مابيغيّرش اللي بيتكتب.
+    أي فشل بيوقف السحب زي الأول: raise_if_failed بعد كل منشور، و close في آخر الجروب.
+    """
+    MAX_POSTS = 25
+
+    def __init__(self, batch_size: int):
+        self.batch_size = batch_size
+        self.queue: queue.Queue = queue.Queue()
+        self.error: BaseException | None = None
+        self.requests = 0
+        self.thread = threading.Thread(target=self._run, name="sheet-sender", daemon=True)
+        self.thread.start()
+
+    def put(self, payload: dict) -> None:
+        self.raise_if_failed()
+        self.queue.put(payload)
+
+    def raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise SystemExit(f"الإرسال للشيت وقف: {self.error}")
+
+    def close(self, check: bool = True) -> None:
+        """بيستنى لحد ما كل اللي في الطابور يتبعت."""
+        self.queue.put(None)
+        self.thread.join()
+        if check:
+            self.raise_if_failed()
+
+    @staticmethod
+    def _comments(payload: dict) -> int:
+        return sum(len(p.get("comments") or []) for p in payload["posts"])
+
+    def _merged(self, items: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for payload in items:
+            last = out[-1] if out else None
+            if (last and last.get("group_id") == payload.get("group_id")
+                    and len(last["posts"]) + len(payload["posts"]) <= self.MAX_POSTS
+                    and self._comments(last) + self._comments(payload) <= self.batch_size):
+                for post in payload["posts"]:
+                    # نفس المنشور مرتين في طلب واحد: الشيت بياخد أول مرة بس، فالتعليقات تتضم في واحد
+                    same = next((p for p in last["posts"] if p.get("post_id") == post.get("post_id")), None)
+                    if same:
+                        same["comments"] = same["comments"] + list(post.get("comments") or [])
+                    else:
+                        last["posts"].append(dict(post, comments=list(post.get("comments") or [])))
+            else:
+                out.append(dict(payload, posts=[dict(p, comments=list(p.get("comments") or []))
+                                                for p in payload["posts"]]))
+        return out
+
+    def _run(self) -> None:
+        done = False
+        while not done:
+            items = [self.queue.get()]
+            while True:
+                try:
+                    items.append(self.queue.get_nowait())
+                except queue.Empty:
+                    break
+            if None in items:
+                done = True
+                items = items[:items.index(None)]
+            for payload in self._merged(items):
+                if self.error is not None:
+                    break
+                try:
+                    answer = sheet_post(payload)
+                except BaseException as exc:  # SystemExit من sheet_post كمان
+                    self.error = exc
+                    break
+                self.requests += 1
+                print(f"sheet: {len(payload['posts'])} posts / {self._comments(payload)} comments: {answer[:220]}",
+                      flush=True)
+
+
+POLL_MS = 250
+
+
+def wait_until(page, ready, max_ms: int) -> bool:
+    """بيستنى لحد ما ready() يبقى True، كل POLL_MS، لحد max_ms بالكتير.
+
+    بدل الانتظار الثابت: نفس الحد الأقصى اللي كان قبل كده، فعمره ما يبقى أبطأ — بس بيخلص أول ما
+    الصفحة تجهز. الانتظارات الثابتة كانت نص وقت المنشور (27.6 من 56.7 ث على 5 منشورات، 2026-10-22).
+    """
+    waited = 0
+    while True:
+        if ready():
+            return True
+        if waited >= max_ms:
+            return False
+        step = min(POLL_MS, max_ms - waited)
+        page.wait_for_timeout(step)
+        waited += step
+
+
 def own_group_post_id(href: str, group_id: str) -> str | None:
     """رقم المنشور لو الرابط لمنشور في الجروب ده بالذات، غير كده None.
 
@@ -289,13 +392,23 @@ FEED_LINKS_JS = """() => {
 }"""
 
 
+def feed_post_ids(page, group_id: str) -> list[str]:
+    ids: list[str] = []
+    for href in page.evaluate(FEED_LINKS_JS):
+        post_id = own_group_post_id(href, group_id)
+        if post_id and post_id not in ids:
+            ids.append(post_id)
+    return ids
+
+
 def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
     page.goto(
         f"https://www.facebook.com/groups/{group_id}?sorting_setting=CHRONOLOGICAL",
         wait_until="domcontentloaded",
         timeout=60000,
     )
-    page.wait_for_timeout(4000)
+    # الموجز بيترسم بعد DOMContentLoaded: لحد ما يظهر منشور من الجروب أو يبان إنه خاص (4 ث بالكتير زي الأول)
+    wait_until(page, lambda: bool(feed_post_ids(page, group_id)) or group_is_private_for_us(page), 4000)
     if group_is_private_for_us(page):
         print(f"الجروب {group_id} خاص والحساب مش عضو فيه — مفيش منشورات نقدر نشوفها", file=sys.stderr)
         return [], ""
@@ -311,11 +424,9 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
     ids: list[str] = []
     stale = 0
     while len(ids) < max_posts and stale < 6:
-        hrefs = page.evaluate(FEED_LINKS_JS)
         before = len(ids)
-        for href in hrefs:
-            post_id = own_group_post_id(href, group_id)
-            if post_id and post_id not in ids:
+        for post_id in feed_post_ids(page, group_id):
+            if post_id not in ids:
                 ids.append(post_id)
                 if len(ids) >= max_posts:
                     break
@@ -323,7 +434,8 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
         if len(ids) >= max_posts:
             break
         page.mouse.wheel(0, 2200)
-        page.wait_for_timeout(1800)
+        # لحد ما منشور جديد يترسم (1.8 ث بالكتير زي الأول)
+        wait_until(page, lambda: any(p not in ids for p in feed_post_ids(page, group_id)), 1800)
     if not ids:
         # جروب مش موجود كان بيخلص بـ 0 منشورات من غير ما يقول حاجة (اتشاف في تشغيل حقيقي)
         print(f"موجز الجروب {group_id} مافيهوش ولا منشور ظاهر — الجروب مش موجود أو فاضي أو مش متاح للحساب",
@@ -435,16 +547,43 @@ def close_open_menu(page) -> None:
         page.keyboard.press("Escape")
 
 
+def comment_count(page) -> int:
+    """كام تعليق/رد مرسوم في جذر المنشور دلوقتي (عشان نعرف إن الضغطة أو التمرير جاب جديد)."""
+    return int(page.evaluate(
+        "() => {" + POST_ROOT_JS + "return postRoot().querySelectorAll(\"div[role='article'][aria-label]\").length; }"))
+
+
+# المنشور اترسم: تعليق، أو زرار فرز، أو فيسبوك كاتب إن مفيش تعليقات / مقفولة / المنشور اتمسح
+POST_READY_JS = "(p) => {" + POST_ROOT_JS + r"""
+  const root = postRoot();
+  if (root.querySelector("div[role='article'][aria-label]")) return true;
+  const sort = new RegExp(p.sort);
+  if ([...root.querySelectorAll('[role="button"]')].some(b => sort.test((b.textContent || '').trim()))) return true;
+  const text = root.textContent || '';
+  return new RegExp(p.none).test(text) || new RegExp(p.off).test(text)
+    || new RegExp(p.gone).test(document.body ? document.body.textContent || '' : '');
+}"""
+
+
+# من غير \b: في JavaScript الحروف العربي مش «word»، فـ \b بعد «الأحدث» عمره ما يطابق
+SORT_BUTTON_JS = r"^(الأكثر ملاءمة|كل التعليقات|الأحدث|Most relevant|All comments|Newest)"
+
+
+def post_ready(page) -> bool:
+    return bool(page.evaluate(POST_READY_JS, {"sort": SORT_BUTTON_JS, "none": NO_COMMENTS_JS,
+                                              "off": COMMENTS_OFF_JS, "gone": UNAVAILABLE_RE.pattern}))
+
+
 def sort_comments_newest(page) -> str:
     """يفتح قائمة فرز التعليقات ويختار «الأحدث». الضغط لازم يكون حقيقي مش JavaScript.
 
     بيرجّع «الأحدث»، أو «no-comments» لو المنشور مفيهوش تعليقات خالص (مفيش زرار فرز
     أصلًا والترتيب مالوش معنى)، أو سبب الفشل.
     """
-    page.wait_for_timeout(1500)
     name = re.compile(r"الأحدث|Newest")
     opener_name = re.compile(r"الأكثر ملاءمة|كل التعليقات|Most relevant|All comments")
-    for _ in range(8):
+    # نفس المهلة الكلية اللي كانت (1.5 + 8×0.7 ث)، بس كل ربع ثانية بدل ما نستنى الأول
+    for _ in range((1500 + 8 * 700) // POLL_MS):
         if page.get_by_role("button", name=name).count():
             return "الأحدث"
         if page.get_by_role("button", name=opener_name).count():
@@ -453,7 +592,7 @@ def sort_comments_newest(page) -> str:
             return "no-comments"
         if comments_off_shown(page):
             return "comments-off"
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(POLL_MS)
     opener = page.get_by_role("button", name=opener_name)
     if not opener.count():
         if no_comments_shown(page):
@@ -468,16 +607,19 @@ def sort_comments_newest(page) -> str:
         target.click(timeout=5000)
     except Exception:
         return "detached"
-    page.wait_for_timeout(1000)
-    option = page.get_by_role("menuitem", name=re.compile(r"الأحدث|Newest|التعليقات الأحدث"))
-    if not option.count():
-        option = page.get_by_text(re.compile(r"^الأحدث"))
+    menu_item = page.get_by_role("menuitem", name=re.compile(r"الأحدث|Newest|التعليقات الأحدث"))
+    menu_text = page.get_by_text(re.compile(r"^الأحدث"))
+    wait_until(page, lambda: bool(menu_item.count() or menu_text.count()), 1000)
+    option = menu_item if menu_item.count() else menu_text
     if not option.count():
         close_open_menu(page)
         return "no-option"
     option.first.click(timeout=5000)
-    page.wait_for_timeout(2000)
-    if page.get_by_role("button", name=name).count():
+    if wait_until(page, lambda: bool(page.get_by_role("button", name=name).count()), 2000):
+        # الزرار بيتغير قبل ما القايمة تتعاد ترتيبها (اتشاف 2026-10-22: أول لقطة طلعت بترتيب «الأكثر ملاءمة»).
+        # نستنى لحد ما التعليقات الظاهرة تبقى فعلًا من الأحدث للأقدم بالوقت الكامل؛ بعدها لو لسه لأ، نكمل
+        # زي الأول (الحد الأقصى 2 + 2.5 ث، والانتظار الثابت القديم كان 2 ث بس قبل أول لقطة)
+        wait_until(page, lambda: comments_newest_first(page), 2500)
         return "الأحدث"
     # ضغطنا «الأحدث» وفيسبوك شال الزرار خالص (اتشاف في تشغيل حقيقي): نتأكد من الترتيب نفسه بالوقت
     if not page.get_by_role("button", name=opener_name).count() and comments_newest_first(page):
@@ -492,6 +634,7 @@ def expand_comments(page, rounds: int = 30) -> int:
     """
     total = 0
     for _ in range(rounds):
+        before = comment_count(page)
         clicked = page.evaluate(
             r"""() => {""" + POST_ROOT_JS + r"""
               const root = postRoot();
@@ -502,7 +645,8 @@ def expand_comments(page, rounds: int = 30) -> int:
               });
               if (!buttons.length) return 0;
               let n = 0;
-              for (const button of buttons.slice(0, 8)) {
+              // 20 مش 8: منشور فيه عشرات «عرض الردود» كان بياخد لفّة كاملة (+انتظار) لكل 8
+              for (const button of buttons.slice(0, 20)) {
                 button.click();
                 n += 1;
               }
@@ -511,19 +655,19 @@ def expand_comments(page, rounds: int = 30) -> int:
         )
         if not clicked:
             page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(700)
-            clicked = page.evaluate(
+            more = lambda: bool(page.evaluate(  # noqa: E731
                 r"""() => {""" + POST_ROOT_JS + r"""
                   const root = postRoot();
                   const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|View more comments|View .*repl/;
                   return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.textContent || '').replace(/\s+/g, ' ').trim()));
                 }"""
-            )
-            if not clicked:
+            ))
+            if not wait_until(page, more, 700):
                 return total
             continue
         total += clicked
-        page.wait_for_timeout(1100)
+        # لحد ما التعليقات/الردود اللي اتطلبت تترسم (1.1 ث بالكتير زي الأول)
+        wait_until(page, lambda: comment_count(page) > before, 1100)
     return total
 
 
@@ -740,6 +884,9 @@ def unavailable_post(group_id: str, post_id: str, url: str) -> dict:
     }
 
 
+# تاب في نافذة مشتركة لازم يبقى قدام عشان يترسم. الـ worker في نافذة لوحده ظاهرة أصلًا، فمالوش لازمة
+# وبيخطف التركيز من الـ workers التانيين
+BRING_TO_FRONT = True
 GOTO_ATTEMPTS = 3
 # لقطات هيدر منشور من غير تعليقات، ثانية بين كل واحدة، لحد ما نوع المحتوى يبان
 HEADER_ROUNDS = 8
@@ -763,8 +910,10 @@ def goto_with_retry(page, url: str) -> None:
 def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_comments: int, on_batch=None, batch_size: int = 80) -> dict:
     url = f"https://www.facebook.com/groups/{group_id}/posts/{post_id}/"
     goto_with_retry(page, url)
-    page.bring_to_front()
-    page.wait_for_timeout(2500)
+    if BRING_TO_FRONT:
+        page.bring_to_front()
+    # بدل 2.5 ث ثابتة: لحد ما المنشور يترسم (4 ث بالكتير = 2.5 هنا + 1.5 اللي كانت في أول الفرز)
+    wait_until(page, lambda: post_ready(page), 4000)
     sort_state = "missing"
     for _ in range(3):
         close_open_menu(page)
@@ -836,7 +985,8 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             batch_index += 1
             on_batch(batch, batch_index, False)
         if no_comments:
-            if header.get("content_kind"):
+            # أول لقطة بقت بدري (من غير الانتظار الثابت)، فالنوع لوحده مش كفاية: صاحب المنشور ووقته كمان
+            if header.get("content_kind") and header.get("author") and header.get("created_time"):
                 break
             continue
         expanded = expand_comments(page, rounds=1)
@@ -844,8 +994,10 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             stale = 0
         else:
             stale += 1
+        shown = comment_count(page)
         moved = scroll_comment_pane(page)
-        page.wait_for_timeout(700)
+        # لحد ما تعليقات جديدة تترسم بعد التمرير (0.7 ث بالكتير زي الأول)
+        wait_until(page, lambda: comment_count(page) > shown, 700)
         # آخر القايمة: مفيش «عرض المزيد» والتمرير ماتحركش — لفّتين كفاية مش 5
         # (5 لفّات فاضية أخدت ~150 ثانية على منشور واحد في تشغيل حقيقي)
         if stale >= 5 or (stale >= 2 and not expanded and not moved):
@@ -880,7 +1032,7 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     }
 
 
-def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: int, max_comments: int, dry: bool = True, batch_size: int = 80, progress=None) -> dict:
+def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: int, max_comments: int, dry: bool = True, batch_size: int = 80, progress=None, sender: SheetSender | None = None) -> dict:
     group_id = group_key(url)
     post_ids, feed_sort = collect_post_ids(page, group_id, max_posts)
     # اسم الجروب من صفحة الموجز نفسها، قبل ما نفتح أي منشور
@@ -928,7 +1080,6 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
             # اتمسح/اتخفى: مالوش صف في الشيت، بس بيتسجّل في الدَمب
             print(f"{group_id}/{post_id}: unavailable (اتمسح أو اتخفى) — اتعدّى")
             unavailable.append(post_id)
-            time.sleep(1.5)
             continue
         print(
             f"{group_id}/{post_id}: comments={post['comments_found']} "
@@ -938,14 +1089,19 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
             comments = post.get("comments") or []
             chunks = [comments[i:i + batch_size] for i in range(0, len(comments), batch_size)] or [[]]
             for index, chunk in enumerate(chunks, 1):
-                answer = sheet_post(sheet_post_payload(group_id, post, chunk))
-                print(f"sheet batch {index}/{len(chunks)} n={len(chunk)}: {answer[:240]}")
+                payload = sheet_post_payload(group_id, post, chunk)
+                if sender:
+                    sender.put(payload)
+                else:
+                    answer = sheet_post(payload)
+                    print(f"sheet batch {index}/{len(chunks)} n={len(chunk)}: {answer[:240]}")
                 post["sheet_batches"] = index
         posts.append(post)
         # بعد كل منشور: لو اللي بعده وقع، اللي خلص يفضل محفوظ (قبل كده كان بيضيع كله)
         if progress:
             progress(result())
-        time.sleep(1.5)
+        if sender:
+            sender.raise_if_failed()
     return result()
 
 
@@ -998,6 +1154,21 @@ def read_groups_file(path: Path) -> list[str]:
     return urls
 
 
+NO_LIMIT = 10 ** 9
+# حد صاحب المشروع (2026-10-22): أكتر من 4 نوافذ بتسحب في نفس الوقت = خطر حظر الحساب من فيسبوك
+MAX_WORKERS = 4
+
+
+def comment_limit(value: str) -> int:
+    """رقم، أو all = كل التعليقات من غير حد."""
+    if value.strip().lower() == "all":
+        return NO_LIMIT
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"رقم أو all: {value}") from None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="أرشفة جروبات فيسبوك إلى Google Sheet")
     parser.add_argument("--group", action="append",
@@ -1007,14 +1178,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-posts", type=int, required=True)
     parser.add_argument("--max-posts", type=int, required=True)
     parser.add_argument("--min-comments", type=int, required=True)
-    parser.add_argument("--max-comments", type=int, required=True)
+    parser.add_argument("--max-comments", type=comment_limit, required=True, help="رقم، أو all لكل التعليقات")
     parser.add_argument("--cdp", default=CDP)
     parser.add_argument("--dry", action="store_true", help="احفظ JSON بس، من غير إرسال للشيت")
-    parser.add_argument("--batch-size", type=int, default=80, help="حجم دفعة الإرسال للشيت لما التعليقات تبقى بالآلاف")
+    parser.add_argument("--batch-size", type=int, default=200, help="أقصى عدد تعليقات في طلب واحد للشيت")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="كام جروب في نفس الوقت، كل واحد في نافذة لوحده (عملية بايثون لكل جروب)")
     parser.add_argument("--debug", action="store_true",
                         help="سجّل الكونسول والأخطاء والشبكة، واحفظ HTML وصورة في debug/ لو حصل خطأ")
     parser.add_argument("--trace", action="store_true",
                         help="مع --debug: سجّل كمان trace.zip و network.har (أتقل، بس بيوريك كل خطوة)")
+    # داخلي: الـ workers بيشغّلوا السكربت ده لجروب واحد بنفس ختم التشغيل، في نافذة جديدة
+    parser.add_argument("--run-stamp", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--new-window", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.min_posts < 1 or args.max_posts < args.min_posts:
         raise SystemExit("min-posts لازم يكون 1 أو أكتر، وmax-posts أكبر منه أو يساويه")
@@ -1022,6 +1198,10 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("min-comments مش سالب، وmax-comments أكبر منه أو يساويه")
     if args.batch_size < 1:
         raise SystemExit("batch-size لازم يكون 1 أو أكتر")
+    if not 1 <= args.workers <= MAX_WORKERS:
+        raise SystemExit(f"workers من 1 لـ {MAX_WORKERS}: أكتر من كده الحساب ممكن يتحظر من فيسبوك (قرار صاحب المشروع)")
+    if args.workers > 1 and args.debug:
+        raise SystemExit("--debug مع جروب واحد بس (--workers 1): التشخيص لإعادة عطل محدد، مش للتشغيل الكبير")
     if not args.group:
         groups_file = Path(args.groups_file) if args.groups_file else GROUPS_FILE
         args.group = read_groups_file(groups_file)
@@ -1038,18 +1218,114 @@ def utf8_console() -> None:
             pass
 
 
+def new_window_page(browser, context):
+    """صفحة في نافذة لوحدها. التابات اللي ورا بعض في نفس النافذة مخفية، والصفحة المخفية مابتترسمش،
+    فكل worker بياخد نافذة ظاهرة بدل تاب."""
+    cdp = browser.new_browser_cdp_session()
+    try:
+        target = cdp.send("Target.createTarget", {"url": "about:blank", "newWindow": True})["targetId"]
+    finally:
+        cdp.detach()
+    # بالـ targetId مش «أول صفحة جديدة»: الـ workers بيفتحوا نوافذ في نفس اللحظة، وكل واحد كان بياخد نافذة التاني
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        for page in context.pages:
+            session = context.new_cdp_session(page)
+            try:
+                if session.send("Target.getTargetInfo")["targetInfo"]["targetId"] == target:
+                    return page
+            finally:
+                session.detach()
+        time.sleep(0.2)
+    raise SystemExit(f"النافذة الجديدة ماظهرتش في المتصفح: {target}")
+
+
+def child_args(args: argparse.Namespace, url: str, stamp: str) -> list[str]:
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--group", url,
+           "--min-posts", str(args.min_posts), "--max-posts", str(args.max_posts),
+           "--min-comments", str(args.min_comments), "--max-comments", str(args.max_comments),
+           "--cdp", args.cdp, "--batch-size", str(args.batch_size), "--run-stamp", stamp, "--new-window"]
+    return cmd + (["--dry"] if args.dry else [])
+
+
+def run_parallel(args: argparse.Namespace, stamp: str) -> int:
+    """كل جروب في عملية بايثون لوحده، args.workers في نفس الوقت. الجروب اللي يخلص بياخد مكانه
+    اللي بعده، فالجروبات الكبيرة مابتعطلش الباقي. جروب يقف (فرز مش «الأحدث» مثلًا) بيقف لوحده
+    وبيتقال صريح، والتشغيل كله بيخلص بـ exit 1."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    total = len(args.group)
+    started = time.time()
+
+    def say(text: str) -> None:
+        with lock:
+            print(f"+{time.time() - started:7.1f} {text}", flush=True)
+
+    def one(index_url: tuple[int, str]) -> dict:
+        index, url = index_url
+        key = group_key(url)
+        say(f"[{index}/{total}] {key}: start")
+        t = time.time()
+        proc = subprocess.Popen(child_args(args, url, stamp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace")
+        last = ""
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                last = line
+                say(f"[{key}] {line}")
+        code = proc.wait()
+        sec = round(time.time() - t, 1)
+        say(f"[{index}/{total}] {key}: {'ok' if code == 0 else f'FAILED exit {code}'} in {sec} s")
+        return {"group": key, "url": url, "exit": code, "seconds": sec, "last_line": "" if code == 0 else last}
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        outcomes = list(pool.map(one, enumerate(args.group, 1)))
+    parts = []
+    for outcome in outcomes:
+        part = DUMP_DIR / f"run-{stamp}-{safe_name(outcome['group'])}.json"
+        if part.exists():
+            try:
+                outcome["result"] = json.loads(part.read_text(encoding="utf-8"))
+                parts.append(part)
+            except ValueError:
+                pass
+    summary = DUMP_DIR / f"run-{stamp}.json"
+    summary.write_text(json.dumps({"workers": args.workers, "seconds": round(time.time() - started, 1),
+                                   "groups": outcomes}, ensure_ascii=False, indent=2), encoding="utf-8")
+    for part in parts:
+        part.unlink()
+    failed = [o for o in outcomes if o["exit"] != 0]
+    print(f"done {summary}: {total - len(failed)}/{total} groups ok in {round(time.time() - started, 1)} s")
+    for o in failed:
+        print(f"  FAILED {o['group']}: {o['last_line']}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def safe_name(text: str) -> str:
+    return re.sub(r"[^\w.-]+", "_", text)
+
+
 def main() -> None:
     utf8_console()
     args = parse_args()
+    DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = args.run_stamp or time.strftime("%Y%m%d-%H%M%S")
+    if args.workers > 1 and len(args.group) > 1:
+        raise SystemExit(run_parallel(args, stamp))
     from playwright.sync_api import sync_playwright
 
-    DUMP_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
     results = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(args.cdp)
         context = browser.contexts[0]
-        page = context.new_page()
+        global BRING_TO_FRONT
+        if args.new_window:
+            page = new_window_page(browser, context)
+            BRING_TO_FRONT = False
+        else:
+            page = context.new_page()
         recorder = None
         if args.debug:
             from browser_debug import PageRecorder
@@ -1064,17 +1340,27 @@ def main() -> None:
                     out.write_text(json.dumps(without_token(payload), ensure_ascii=False, indent=2), encoding="utf-8")
                     return out
 
-                payload = archive_group(
-                    page,
-                    url,
-                    args.min_posts,
-                    args.max_posts,
-                    args.min_comments,
-                    args.max_comments,
-                    dry=args.dry,
-                    batch_size=args.batch_size,
-                    progress=save,
-                )
+                # الإرسال في الخلفية؛ في آخر كل جروب بنستنى لحد ما يخلص، حتى لو الجروب وقف في النص
+                sender = None if args.dry else SheetSender(args.batch_size)
+                try:
+                    payload = archive_group(
+                        page,
+                        url,
+                        args.min_posts,
+                        args.max_posts,
+                        args.min_comments,
+                        args.max_comments,
+                        dry=args.dry,
+                        batch_size=args.batch_size,
+                        progress=save,
+                        sender=sender,
+                    )
+                except BaseException:
+                    if sender:
+                        sender.close(check=False)
+                    raise
+                if sender:
+                    sender.close()
                 results.append(without_token(payload))
                 print("saved", save(payload))
                 # جروب من غير منشورات (خاص، فاضي): مفيش حاجة تتبعت
@@ -1094,8 +1380,10 @@ def main() -> None:
             if recorder:
                 recorder.detach()
             page.close()
-            # الملخص بيتكتب حتى لو التشغيل وقع، بالجروبات اللي خلصت + سبب الوقوع
-            summary = DUMP_DIR / f"run-{stamp}.json"
+            # الملخص بيتكتب حتى لو التشغيل وقع، بالجروبات اللي خلصت + سبب الوقوع.
+            # worker لجروب واحد بيكتب ملخصه باسم الجروب، والأب بيجمعهم في run-<stamp>.json
+            summary = DUMP_DIR / (f"run-{stamp}-{safe_name(group_key(args.group[0]))}.json"
+                                  if args.run_stamp else f"run-{stamp}.json")
             summary.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
             print("done", summary)
 

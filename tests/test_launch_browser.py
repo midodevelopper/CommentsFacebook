@@ -150,6 +150,9 @@ def test_launch_command_line_is_exact(sandbox):
         f"--user-data-dir={sandbox['profile']}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
         "--new-window",
         launch_browser.READY_PAGE.as_uri(),
     ]

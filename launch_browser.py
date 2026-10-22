@@ -65,6 +65,11 @@ def launch(port: int) -> int:
         f"--user-data-dir={PROFILE}",
         "--no-first-run",
         "--no-default-browser-check",
+        # Playwright بيحطهم لما هو اللي يفتح المتصفح، وإحنا بنفتحه بنفسنا: من غيرهم النافذة اللي ورا
+        # أو المتغطية بتتبطّأ (timers وrendering)، وده بيوقف السحب لما في أكتر من worker
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
         "--new-window",
         READY_PAGE.as_uri() if READY_PAGE.exists() else "about:blank",
     ]

@@ -10,6 +10,7 @@ headless context with the Facebook simulator routed in, and WEBAPP points at loo
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 import pytest
@@ -91,7 +92,9 @@ def test_full_workflow(monkeypatch, world, capsys):
     assert all(isinstance(v["comment_id"], str) for v in rows.values())
 
     out = capsys.readouterr().out
-    assert "sheet batch 1/2 n=3" in out and "sheet batch 2/2 n=2" in out and "sheet batch 1/1 n=3" in out
+    # الإرسال في الخلفية: كل تعليق اتبعت مرة، ومفيش طلب أكبر من --batch-size
+    sent = [int(n) for n in re.findall(r"^sheet: \d+ posts / (\d+) comments: \{\"ok\":true", out, re.M)]
+    assert sum(sent) == 8 and sent and max(sent) <= 3
     dump = json.loads(next(world["dumps"].glob(f"{G}-*.json")).read_text(encoding="utf-8"))
     assert dump["posts_found"] == 2 and dump["posts"][0]["comments_found"] == 5
 

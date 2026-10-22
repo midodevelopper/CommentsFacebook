@@ -252,13 +252,13 @@ def test_expand_never_clicks_reply_buttons(page, fake_fb):
     assert page.locator("[role=textbox][data-for]:not([data-for=post])").count() == 0
 
 
-def test_expand_clicks_at_most_8_buttons_per_round(page, fake_fb):
-    cs = comments(12)
+def test_expand_clicks_at_most_20_buttons_per_round(page, fake_fb):
+    cs = comments(24)
     for i, c in enumerate(cs):
         c.replies = [Comment(id=str(7000 + i))]
     open_post(page, fake_fb, Post("1", comments=cs, sort_mode="newest"))
     scraper.expand_comments(page, rounds=1)
-    assert len([c for c in clicks(page) if c.startswith("replies:")]) == 8
+    assert len([c for c in clicks(page) if c.startswith("replies:")]) == 20
 
 
 def test_expand_english_ui(page, fake_fb):

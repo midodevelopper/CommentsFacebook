@@ -94,9 +94,10 @@ function doPost(e) {
     const postCols = headerMap_(ps);
     const commentCols = headerMap_(cs);
     const now = new Date();
-    let np = 0, up = 0, nc = 0, uc = 0;
     const seenPosts = {};
     const seenComments = {};
+    const postItems = [];
+    const commentItems = [];
 
     (body.posts || []).forEach(p => {
       const postId = idText_(p.post_id);
@@ -115,7 +116,7 @@ function doPost(e) {
         comment_sort: p.comment_sort || '',
         received_at: now
       };
-      upsert_(ps, postId, rowFrom_(postCols, postValues), postCols, Object.keys(postValues)) ? np++ : up++;
+      postItems.push({id: postId, values: postValues});
 
       (p.comments || []).forEach(c => {
         const commentId = idText_(c.comment_id);
@@ -140,9 +141,11 @@ function doPost(e) {
           reply_status: c.reply_status || '',
           received_at: now
         };
-        upsert_(cs, commentId, rowFrom_(commentCols, commentValues), commentCols, Object.keys(commentValues)) ? nc++ : uc++;
+        commentItems.push({id: commentId, values: commentValues});
       });
     });
+    const [np, up] = upsertMany_(ps, postCols, postItems);
+    const [nc, uc] = upsertMany_(cs, commentCols, commentItems);
     return json_({
       ok: true,
       posts_new: np,
@@ -172,25 +175,63 @@ function upsert_(sh, id, row, cols, keys) {
   if (!key) throw new Error('missing id');
   const hit = findIdRow_(sh, key);
   if (hit) {
-    const current = sh.getRange(hit, 1, 1, row.length).getValues()[0];
-    const owned = {};
-    (keys || Object.keys(cols)).forEach(name => { if (cols[name] !== undefined) owned[cols[name]] = true; });
-    for (let i = 0; i < row.length; i++) {
-      if (!owned[i]) row[i] = current[i];
-    }
-    KEEP_IF_BLANK.forEach(name => {
-      const index = cols[name];
-      if (index === undefined) return;
-      if (!row[index] && current[index]) row[index] = current[index];
-    });
-    sh.getRange(hit, 1, 1, row.length).setNumberFormat('@');
-    sh.getRange(hit, 1, 1, row.length).setValues([row]);
+    updateRow_(sh, hit, row, cols, keys);
     return false;
   }
-  const dest = sh.getLastRow() + 1;
-  sh.getRange(dest, 1, 1, row.length).setNumberFormat('@');
-  sh.getRange(dest, 1, 1, row.length).setValues([row]);
+  writeRows_(sh, sh.getLastRow() + 1, [row]);
   return true;
+}
+
+// كل صفوف الطلب مرة واحدة: عمود الـ id بيتقري مرة، والصفوف الجديدة بتتكتب في نداء واحد.
+// قبل كده كل صف كان بيقرا عمود الـ id كله ويكتب لوحده (2–3 نداءات) تحت القفل، فالوقت بيكبر
+// مع كل تعليق في الشيت — آلاف التعليقات كانت هتاخد ساعات. بيرجّع [جديد، اتحدّث].
+function upsertMany_(sh, cols, items) {
+  const index = {};
+  const last = sh.getLastRow();
+  if (last >= 2) {
+    sh.getRange(2, 1, last - 1, 1).getValues().forEach((r, i) => {
+      const key = idText_(r[0]);
+      if (key && !index[key]) index[key] = i + 2;
+    });
+  }
+  const fresh = [];
+  let updated = 0;
+  items.forEach(item => {
+    const key = idText_(item.id);
+    if (!key) throw new Error('missing id');
+    const row = rowFrom_(cols, item.values);
+    if (index[key]) {
+      updateRow_(sh, index[key], row, cols, Object.keys(item.values));
+      updated++;
+    } else {
+      fresh.push(row);
+    }
+  });
+  if (fresh.length) writeRows_(sh, last + 1, fresh);
+  return [fresh.length, updated];
+}
+
+// الأعمدة اللي الصف ده مش بيكتبها (عمود ضافه صاحب الشيت) بتفضل زي ما هي، والرد المكتوب مابيتمسحش
+function updateRow_(sh, hit, row, cols, keys) {
+  const current = sh.getRange(hit, 1, 1, row.length).getValues()[0];
+  const owned = {};
+  (keys || Object.keys(cols)).forEach(name => { if (cols[name] !== undefined) owned[cols[name]] = true; });
+  for (let i = 0; i < row.length; i++) {
+    if (!owned[i]) row[i] = current[i];
+  }
+  KEEP_IF_BLANK.forEach(name => {
+    const index = cols[name];
+    if (index === undefined) return;
+    if (!row[index] && current[index]) row[index] = current[index];
+  });
+  writeRows_(sh, hit, [row]);
+}
+
+// الـ ids نص ('@') قبل الكتابة، وإلا الشيت بيحوّل الرقم الطويل لـ Number ويضيّع آخره
+function writeRows_(sh, first, rows) {
+  const range = sh.getRange(first, 1, rows.length, rows[0].length);
+  range.setNumberFormat('@');
+  range.setValues(rows);
 }
 
 function findIdRow_(sh, id) {

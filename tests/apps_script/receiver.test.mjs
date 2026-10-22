@@ -491,3 +491,22 @@ test('scale: batches of the same post accumulate without duplicates', () => {
   assert.equal(r.ss.getSheetByName('Comments').records().length, 10);
   assert.equal(r.ss.getSheetByName('Posts').records().length, 1);
 });
+
+test('scale: one request reads the id column once per tab and appends new rows in one write', () => {
+  const r = loadReceiver();
+  r.call('setup');
+  const cs = r.ss.getSheetByName('Comments');
+  r.post(body([post('10', [comment('600')])]));
+  const calls = [];
+  const original = cs.getRange.bind(cs);
+  cs.getRange = (...a) => { calls.push(a); return original(...a); };
+  const many = Array.from({ length: 300 }, (_, i) => comment(String(700000000000000 + i)));
+  const out = r.post(body([post('10', many.concat([comment('600')]))]));
+  assert.equal(out.comments_new, 300);
+  assert.equal(out.comments_updated, 1);
+  assert.ok(calls.length < 15, `getRange called ${calls.length} times for 301 comments`);
+  const recs = cs.records();
+  assert.equal(recs.length, 301);
+  assert.equal(recs[1].comment_id, '700000000000000');
+  assert.equal(recs[300].comment_id, '700000000000299');
+});
