@@ -109,7 +109,9 @@ def test_full_workflow(monkeypatch, world, capsys):
     assert f"{ok_target} posted" in out and f"{gone_target} no-comment" in out
     assert wait_for(world["pw"].context.pages[0] if world["pw"].context.pages else _page(world),
                     lambda: len(fb.replies) == 1)
-    assert fb.replies[0]["comment_id"] == ok_target and fb.replies[0]["text"] == "شكرًا على تعليقك"
+    assert fb.replies[0]["comment_id"] == ok_target
+    # the @mention Facebook puts in the box stays in front of the reply (owner's choice 2026-10-22)
+    assert fb.replies[0]["text"] == f"{world['c1'][0].author} شكرًا على تعليقك"
 
     rows = {r["comment_id"]: r for r in sheet.rows("Comments")}
     assert rows[ok_target]["reply_status"] == "posted"

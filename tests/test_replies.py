@@ -144,6 +144,9 @@ def loop(monkeypatch):
              "pw_used": False, "page_closed": False}
 
     class Page:
+        def on(self, event, fn):
+            state.setdefault("handlers", []).append(event)
+
         def close(self):
             state["page_closed"] = True
 
@@ -338,10 +341,11 @@ def sent(page):
 
 @pytest.mark.browser
 def test_post_one_types_reply_and_submits_with_enter(page, fake_fb):
+    """The @mention Facebook puts in the box stays in front of the reply (owner's choice 2026-10-22)."""
     post = setup_post(fake_fb)
     target = post.comments[1].id
     assert replies.post_one(page, item(target, "شكرًا لك 🌙")) == "posted"
-    assert sent(page) == [{"comment_id": target, "text": "شكرًا لك 🌙",
+    assert sent(page) == [{"comment_id": target, "text": f"{post.comments[1].author} شكرًا لك 🌙",
                            "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={target}"}]
     assert wait_for(page, lambda: len(fake_fb.replies) == 1)
     assert fake_fb.replies[0]["comment_id"] == target
@@ -415,10 +419,11 @@ def test_post_one_navigation_failure_raises(page, fake_fb, context):
 
 
 @pytest.mark.browser
-def test_post_one_reports_posted_without_verifying_publication(page, fake_fb):
-    """Characterization (defect D-03): Facebook ignoring the Enter still returns 'posted'."""
+def test_post_one_unconfirmed_when_reply_never_shows(page, fake_fb, monkeypatch):
+    """Fixed D-03: Facebook ignoring the Enter used to return 'posted' (and the Sheet row got marked)."""
+    monkeypatch.setattr(replies, "CONFIRM_MS", 1000)
     post = setup_post(fake_fb, reply_submit="ignore")
-    assert replies.post_one(page, item(post.comments[0].id)) == "posted"
+    assert replies.post_one(page, item(post.comments[0].id)) == "unconfirmed"
     assert sent(page) == []
 
 
@@ -430,7 +435,7 @@ def test_post_one_types_into_the_new_reply_box_not_the_public_composer(page, fak
     post = setup_post(fake_fb, composer=composer)
     target = post.comments[1].id
     assert replies.post_one(page, item(target, "شكرا")) == "posted"
-    assert sent(page) == [{"comment_id": target, "text": "شكرا",
+    assert sent(page) == [{"comment_id": target, "text": f"{post.comments[1].author} شكرا",
                            "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={target}"}]
 
 
@@ -462,8 +467,8 @@ def test_post_one_only_prefix_present_is_no_comment(page, fake_fb):
 
 @pytest.mark.browser
 def test_post_one_multiline_reply_text(page, fake_fb):
-    """Characterization: fill() inserts the text as-is; only the final Enter key submits."""
-    post = setup_post(fake_fb)
+    """Characterization: the text is inserted as-is (after the mention); only the final Enter key submits."""
+    post = setup_post(fake_fb, mention=False)
     replies.post_one(page, item(post.comments[0].id, "سطر 1\nسطر 2"))
     assert sent(page)[0]["text"] == "سطر 1\nسطر 2"
 
@@ -477,3 +482,212 @@ def test_post_one_clicks_reply_with_synthetic_click(page, fake_fb):
         document.addEventListener('click', e => window.__trusted.push(e.isTrusted), true);""")
     replies.post_one(page, item(post.comments[0].id))
     assert page.evaluate("window.__trusted") == [False, True]
+
+
+# ---------------------------------------------------------------- live run 2026-10-22: reply box, mention, D-03, leaving
+
+@pytest.mark.browser
+@pytest.mark.parametrize("target_index", [0, 1, 2])
+def test_post_one_uses_the_prerendered_reply_box_of_its_own_comment(page, fake_fb, target_index):
+    """Live 2026-10-22: the reply composer exists before the click, so 'a new textbox' found nothing
+    (no-reply-box). Every comment has its own hidden composer; the target's must be the one used."""
+    post = setup_post(fake_fb, reply_box_prerendered=True, composer="bottom")
+    target = post.comments[target_index]
+    assert replies.post_one(page, item(target.id, "صباحك فل")) == "posted"
+    assert sent(page) == [{"comment_id": target.id, "text": f"{target.author} صباحك فل",
+                           "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={target.id}"}]
+
+
+@pytest.mark.browser
+def test_post_one_prerendered_box_after_existing_replies(page, fake_fb):
+    cs = comments(2)
+    cs[0].replies = [Comment(id="880000000000001", text="رد قديم")]
+    setup_post(fake_fb, cs=cs, reply_box_prerendered=True)
+    assert replies.post_one(page, item(cs[0].id, "تمام")) == "posted"
+    assert sent(page)[0]["comment_id"] == cs[0].id
+
+
+@pytest.mark.browser
+def test_post_one_without_mention_prefill_sends_reply_alone(page, fake_fb):
+    post = setup_post(fake_fb, mention=False)
+    assert replies.post_one(page, item(post.comments[0].id, "شكرا")) == "posted"
+    assert sent(page)[0]["text"] == "شكرا"
+
+
+@pytest.mark.browser
+def test_post_one_typing_failed_sends_nothing(page, fake_fb, monkeypatch):
+    from playwright.sync_api import Keyboard
+    monkeypatch.setattr(Keyboard, "insert_text", lambda self, text: None)
+    post = setup_post(fake_fb)
+    assert replies.post_one(page, item(post.comments[0].id)) == "typing-failed"
+    assert sent(page) == []
+
+
+@pytest.mark.browser
+def test_post_one_existing_reply_is_not_posted_twice(page, fake_fb):
+    """A previous run sent the reply but did not mark it (unconfirmed / mark_replied failed): no repost.
+    The thread's collapsed replies are opened to look for it."""
+    cs = comments(2)
+    cs[0].replies = [Comment(id="880000000000001", author="أنا", author_id="100000000000777", text="أنا شكرا")]
+    fake_fb.add_group(Group(G), [Post(P, comments=cs, sort_mode="newest", replies_hidden=True)])
+    assert replies.post_one(page, item(cs[0].id, "شكرا")) == "already-posted"
+    assert sent(page) == []
+    assert f"replies:{cs[0].id}" in page.evaluate("window.__clicks")
+
+
+@pytest.mark.browser
+def test_post_one_same_text_by_someone_else_does_not_count(page, fake_fb, context):
+    context.add_cookies([{"name": "c_user", "value": "100000000000777", "domain": ".facebook.com", "path": "/"}])
+    cs = comments(2)
+    cs[0].replies = [Comment(id="880000000000001", author="غيري", author_id="100000000000555", text="شكرا")]
+    setup_post(fake_fb, cs=cs)
+    assert replies.post_one(page, item(cs[0].id, "شكرا")) == "posted"
+    assert len(sent(page)) == 1
+
+
+@pytest.mark.browser
+def test_post_one_confirms_reply_by_own_account(page, fake_fb, context):
+    context.add_cookies([{"name": "c_user", "value": "100000000000777", "domain": ".facebook.com", "path": "/"}])
+    post = setup_post(fake_fb)
+    assert replies.post_one(page, item(post.comments[0].id, "شكرا")) == "posted"
+
+
+@pytest.mark.browser
+def test_post_one_reply_shown_under_another_account_is_unconfirmed(page, fake_fb, context, monkeypatch):
+    monkeypatch.setattr(replies, "CONFIRM_MS", 1000)
+    context.add_cookies([{"name": "c_user", "value": "100000000000999", "domain": ".facebook.com", "path": "/"}])
+    post = setup_post(fake_fb)
+    assert replies.post_one(page, item(post.comments[0].id, "شكرا")) == "unconfirmed"
+
+
+def _leave_draft(fake_fb):
+    """Live 2026-10-22: a reply box left with text (here: Enter ignored) asks before leaving the page."""
+    post = setup_post(fake_fb, reply_submit="ignore")
+    fake_fb.add_post(G, Post("78", comments=comments(1), sort_mode="newest"))
+    return post
+
+
+@pytest.mark.browser
+def test_recorder_dismissing_the_leave_prompt_aborts_next_navigation(page, fake_fb, monkeypatch):
+    """Characterization of the live failure (2026-10-22, --debug): PageRecorder dismisses every dialog,
+    the dismissed beforeunload cancels the next goto (ERR_ABORTED), and every later reply fails.
+    (Without any dialog listener Playwright lets the page leave.)"""
+    import browser_debug
+
+    monkeypatch.setattr(replies, "CONFIRM_MS", 500)
+    post = _leave_draft(fake_fb)
+    rec = browser_debug.PageRecorder(page, label="t", use_cdp=False)
+    try:
+        assert replies.post_one(page, item(post.comments[0].id)) == "unconfirmed"
+        with pytest.raises(Exception) as exc:
+            page.goto(f"https://www.facebook.com/groups/{G}/posts/78/", wait_until="domcontentloaded", timeout=10000)
+        assert "ERR_ABORTED" in str(exc.value)
+        assert [e["dialog_type"] for e in rec.errors if e.get("kind") == "dialog"] == ["beforeunload"]
+    finally:
+        rec.detach()
+
+
+@pytest.mark.browser
+def test_accept_leaving_before_recorder_lets_the_next_reply_load(page, fake_fb, monkeypatch):
+    """Fixed: main() registers accept_leaving before the recorder, so one failed reply no longer blocks
+    the next ones, and the recorder still logs the dialog."""
+    import browser_debug
+
+    monkeypatch.setattr(replies, "CONFIRM_MS", 500)
+    post = _leave_draft(fake_fb)
+    page.on("dialog", replies.accept_leaving)
+    rec = browser_debug.PageRecorder(page, label="t", use_cdp=False)
+    try:
+        assert replies.post_one(page, item(post.comments[0].id)) == "unconfirmed"
+        nxt = fake_fb.posts[(G, "78")].comments[0].id
+        it = item(nxt)
+        it["permalink"] = f"https://www.facebook.com/groups/{G}/posts/78/?comment_id={nxt}"
+        assert replies.post_one(page, it) == "posted"
+        assert [e["dialog_type"] for e in rec.errors if e.get("kind") == "dialog"] == ["beforeunload"]
+    finally:
+        rec.detach()
+
+
+@pytest.mark.unit
+def test_main_marks_already_posted_and_not_unconfirmed(monkeypatch, loop, capsys):
+    loop["pending"]["replies"] = [item("1"), item("2"), item("3")]
+    loop["outcomes"] = {"1": "already-posted", "2": "unconfirmed", "3": "typing-failed"}
+    run(monkeypatch, "--debug")
+    assert [p["comment_ids"] for p in loop["posted"]] == [["1"]]
+    assert "2 الرد اتبعت بس ماظهرش" in capsys.readouterr().err
+    assert FakeRecorder.instances[0].dumps == ["unconfirmed-2", "typing-failed-3"]
+
+
+@pytest.mark.unit
+def test_main_registers_dialog_handler_before_recorder(monkeypatch, loop):
+    import browser_debug
+
+    order = []
+
+    class Page:
+        def on(self, event, fn):
+            order.append(("on", event, fn))
+
+        def close(self):
+            pass
+
+    class Ctx:
+        def new_page(self):
+            return Page()
+
+    class B:
+        contexts = [Ctx()]
+
+    class PW:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        class chromium:
+            connect_over_cdp = staticmethod(lambda url: B())
+
+    class Rec(FakeRecorder):
+        def __init__(self, page, **k):
+            order.append(("recorder",))
+            super().__init__(page, **k)
+
+    monkeypatch.setattr(replies, "sync_playwright", lambda: PW())
+    monkeypatch.setattr(browser_debug, "PageRecorder", Rec)
+    loop["pending"]["replies"] = [item("1")]
+    run(monkeypatch, "--debug")
+    assert order[0] == ("on", "dialog", replies.accept_leaving) and order[1] == ("recorder",)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind,expected", [("beforeunload", "accept"), ("alert", "dismiss"), ("confirm", "dismiss")])
+def test_accept_leaving_accepts_only_beforeunload(kind, expected):
+    calls = []
+
+    class D:
+        type = kind
+
+        def accept(self):
+            calls.append("accept")
+
+        def dismiss(self):
+            calls.append("dismiss")
+
+    replies.accept_leaving(D())
+    assert calls == [expected]
+
+
+@pytest.mark.browser
+def test_post_one_reply_glued_to_mention_is_not_sent(page, fake_fb, monkeypatch):
+    """The box must read «mention + space + reply»; text glued to the mention is not sent."""
+    from playwright.sync_api import Keyboard
+    real = Keyboard.insert_text
+
+    def glued(self, text):
+        page.evaluate("() => { const b = document.querySelector('[data-hermes-target]'); b.textContent = b.textContent.trimEnd(); }")
+        real(self, text.lstrip())
+    monkeypatch.setattr(Keyboard, "insert_text", glued)
+    post = setup_post(fake_fb)
+    assert replies.post_one(page, item(post.comments[0].id, "شكرا")) == "typing-failed"
+    assert sent(page) == []

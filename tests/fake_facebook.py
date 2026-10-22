@@ -58,7 +58,15 @@ class Post:
     composer: str | None = "top"          # top | bottom | None  (main "write a comment" box)
     reply_button: bool = True
     reply_box: bool = True
-    reply_submit: str = "ok"              # ok | ignore
+    reply_submit: str = "ok"              # ok (reply shows under the comment) | ignore (Enter does nothing)
+    # live 2026-10-22: the reply composer («اكتب ردًا عامًا...») already exists before Reply is clicked,
+    # and the click fills in an @mention of the comment's author
+    reply_box_prerendered: bool = False
+    mention: bool = True
+    # live 2026-10-22: a non-empty composer makes leaving the page raise a beforeunload dialog
+    draft_guard: bool = True
+    me_id: str = "100000000000777"        # the logged-in account (author of the replies we post)
+    me_name: str = "أنا"
     external_url: str | None = None
     video_src: str | None = None
     escape_closes: bool = False           # live 2026-10-21: Escape closes the post dialog -> facebook.com/
@@ -102,10 +110,12 @@ const EN = D.lang === 'en';
 const T = EN
   ? {relevant: 'Most relevant', all: 'All comments', newest: 'Newest', newestItem: 'Newest',
      more: 'View more comments', reply: 'Reply', replies: n => `View ${n} replies`,
-     comment: 'Comment by ', replyBy: 'Reply by ', write: 'Write a comment…'}
+     comment: 'Comment by ', replyBy: 'Reply by ', writeComment: 'Write a public comment…',
+     writeReply: 'Write a public reply…'}
   : {relevant: 'الأكثر ملاءمة', all: 'كل التعليقات', newest: 'الأحدث', newestItem: 'الأحدث',
      more: 'عرض المزيد من التعليقات', reply: 'رد', replies: n => `عرض ${n} رد`,
-     comment: 'تعليق بواسطة ', replyBy: 'رد بواسطة ', write: 'اكتب تعليقًا…'};
+     comment: 'تعليق بواسطة ', replyBy: 'رد بواسطة ', writeComment: 'اكتب تعليقًا عامًا...',
+     writeReply: 'اكتب ردًا عامًا...'};
 const G = D.group_id, P = D.post_id;
 const base = `https://www.facebook.com/groups/${G}`;
 const tok = '__cft__[0]=AZtrackingtoken&__tn__=R';
@@ -147,9 +157,26 @@ function article(c, parent) {
     D.reply_button ? el('div', {role: 'button', 'data-action': 'reply', 'data-cid': c.id, tabindex: '0'}, T.reply) : null);
 }
 
-function composer(forId) {
-  return el('div', {role: 'textbox', contenteditable: 'true', 'data-for': forId, 'aria-label': T.write});
+function composer(forId, kind) {
+  return el('div', {role: 'textbox', contenteditable: 'true', 'data-for': forId,
+                    'aria-label': kind === 'reply' ? T.writeReply : T.writeComment});
 }
+
+const findComment = id => {
+  for (const c of D.comments) {
+    if (c.id === id) return {c, parent: null};
+    const r = (c.replies || []).find(x => x.id === id);
+    if (r) return {c: r, parent: c};
+  }
+  return null;
+};
+let replySeq = 0;
+if (D.draft_guard) window.addEventListener('beforeunload', e => {
+  if ([...document.querySelectorAll('[role=textbox]')].some(b => (b.textContent || '').trim())) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
 
 function ordered() {
   return (sort === 'newest' || D.sort_mode === 'none') ? D.comments : [...D.comments].reverse();
@@ -212,6 +239,17 @@ function render() {
       list.append(el('div', {role: 'button', 'data-action': 'replies', 'data-cid': c.id}, T.replies(reps.length)));
     }
   }
+  // hidden per-comment reply composers, appended after each thread (live 2026-10-22)
+  if (D.reply_box_prerendered) {
+    for (const c of visible) {
+      const box = composer(c.id, 'reply');
+      box.style.display = 'none';
+      const thread = list.querySelector(`[role=article][data-cid="${c.id}"]`);
+      let after = thread;
+      while (after.nextElementSibling && after.nextElementSibling.classList.contains('replies')) after = after.nextElementSibling;
+      after.after(box);
+    }
+  }
   host.append(list);
   if (D.comments_off) host.append(el('div', {}, EN ? 'Commenting has been turned off for this post.' : 'تم إيقاف تشغيل التعليقات لهذا المنشور من قبل صاحبه.'));
   else if (!D.comments.length && D.no_comments_text) host.append(el('h3', {}, EN ? 'No comments yet' : 'لا توجد تعليقات حتى الآن'));
@@ -247,7 +285,14 @@ document.addEventListener('click', e => {
   }
   else if (act === 'reply') {
     if (!D.reply_box) return;
-    t.closest('[role=article]').after(composer(t.dataset.cid));
+    let box = D.reply_box_prerendered && document.querySelector(`[role=textbox][data-for="${t.dataset.cid}"]`);
+    if (box) box.style.display = '';
+    else {
+      box = composer(t.dataset.cid, 'reply');
+      t.closest('[role=article]').after(box);
+    }
+    const found = findComment(t.dataset.cid);
+    if (D.mention && found) box.textContent = found.c.author + ' ';   // editors keep a typed trailing space as nbsp
   }
 });
 
@@ -261,10 +306,18 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && box) {
     e.preventDefault();
     if (D.reply_submit === 'ignore') return;
-    const row = {comment_id: box.dataset.for, text: box.innerText, url: location.href};
+    const row = {comment_id: box.dataset.for, text: box.innerText.replace(/ /g, ' '), url: location.href};
     window.__sent.push(row);
     fetch('/__test/reply', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(row)});
     box.dataset.sent = '1';
+    // like Facebook: the reply shows up in the thread and the composer empties
+    const found = findComment(box.dataset.for);
+    if (found) {
+      const r = {id: String(9900000000000000 + (++replySeq)), author: D.me_name, author_id: D.me_id,
+                 text: box.innerText.trim(), time: 'الآن'};
+      box.before(article(r, found.parent || found.c));
+    }
+    box.textContent = '';
   }
 });
 
