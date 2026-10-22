@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,10 +62,16 @@ def test_profile_is_fixed_project_profile_dir():
     assert launch_browser.ROOT == Path(launch_browser.__file__).resolve().parent
 
 
-def test_profile_resolves_to_d_hermes_browser_profile_on_owner_machine():
-    if launch_browser.ROOT != Path(r"D:\Hermes Browser"):
-        pytest.skip("only meaningful in the owner's checkout")
-    assert launch_browser.PROFILE == Path(r"D:\Hermes Browser\profile")
+def test_no_absolute_drive_paths_in_project_files():
+    """The project moves between machines/drives; every path must follow the project folder."""
+    drive_path = re.compile(r"\b[A-Za-z]:[\\/]")
+    names = ["launch_browser.py", "fb_groups_to_sheet.py", "fb_return_replies.py",
+             "browser_debug.py", "start-cdp-browser.cmd", "cdp-ready.html", ".mcp.json"]
+    hits = [f"{name}:{i}: {line.strip()}"
+            for name in names
+            for i, line in enumerate((ROOT / name).read_text(encoding="utf-8").splitlines(), 1)
+            if drive_path.search(line)]
+    assert hits == []
 
 
 def test_default_port_is_9333():
@@ -269,6 +276,6 @@ def test_cmd_launcher_targets_venv_python_and_launch_browser():
 def test_ready_page_is_static_and_mentions_profile_and_port():
     """Characterization: the page hardcodes 9333 even when --port changes it."""
     html = (ROOT / "cdp-ready.html").read_text(encoding="utf-8")
-    assert r"D:\Hermes Browser\profile" in html
+    assert "profile\\" in html
     assert "127.0.0.1:9333" in html
     assert "<script" not in html.lower()

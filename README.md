@@ -13,7 +13,7 @@ that sheet, by driving a real Chromium over CDP against one fixed browser profil
 المتصفح بيشتغل **دايمًا** على البروفايل:
 
 ```
-D:\Hermes Browser\profile
+profile\        (جوه فولدر المشروع، أيًا كان مكانه)
 ```
 
 ده المقصود منه: تسجّل دخول فيسبوك **مرة واحدة** والجلسة تفضل محفوظة، فالسكربتات

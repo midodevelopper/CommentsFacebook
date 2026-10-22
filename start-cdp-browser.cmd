@@ -1,5 +1,5 @@
 @echo off
-rem يفتح كروميوم بتاع Playwright على البروفايل الثابت D:\Hermes Browser\profile
+rem يفتح كروميوم بتاع Playwright على البروفايل الثابت profile\ جوه فولدر المشروع
 rem مع منفذ CDP 127.0.0.1:9333
 setlocal
 set "ROOT=%~dp0"

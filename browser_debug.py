@@ -62,7 +62,7 @@ r"""
                   .venv\Scripts\python.exe -m playwright show-trace debug\...\trace.zip
         --har     يحفظ network.har (كل الطلبات والردود بالتفصيل)
 
-المخرجات في:  D:\Hermes Browser\debug\<الوقت>-<الاسم>\
+المخرجات في:  debug\<الوقت>-<الاسم>\  جوه فولدر المشروع (أو FB_DEBUG_DIR)
 """
 from __future__ import annotations
 

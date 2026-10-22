@@ -31,10 +31,10 @@ def test_constants():
     assert str(scraper.DUMP_DIR).endswith("dumps")
 
 
-def test_dump_dir_is_absolute_hardcoded_path():
-    """Characterization: DUMP_DIR is an absolute literal, unlike ROOT-relative paths elsewhere."""
+def test_dump_dir_is_relative_to_project_folder():
+    """DUMP_DIR follows the project folder, so the project keeps working after a move."""
     source = (ROOT / "fb_groups_to_sheet.py").read_text(encoding="utf-8")
-    assert 'DUMP_DIR = Path(r"D:\\Hermes Browser\\dumps")' in source
+    assert 'DUMP_DIR = Path(__file__).resolve().parent / "dumps"' in source
 
 
 @pytest.mark.cli

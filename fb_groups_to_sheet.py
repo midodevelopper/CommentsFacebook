@@ -34,7 +34,7 @@ WEBAPP = (
 )
 TOKEN = os.environ.get("FB_SHEET_TOKEN", "CommentSecrets")
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
-DUMP_DIR = Path(r"D:\Hermes Browser\dumps")
+DUMP_DIR = Path(__file__).resolve().parent / "dumps"
 
 GROUP_RE = re.compile(r"facebook\.com/groups/([^/?#]+)", re.I)
 POST_RE = re.compile(r"/groups/[^/]+/(?:posts|permalink)/(\d+)")

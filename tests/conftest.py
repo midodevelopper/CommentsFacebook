@@ -5,7 +5,7 @@ Safety rails, applied to every test:
     A test that accidentally calls the real Apps Script or Facebook fails loudly.
   * browser_debug.DEBUG_DIR and fb_groups_to_sheet.DUMP_DIR point at tmp dirs.
   * Browser tests use a throwaway headless Chromium (temporary profile),
-    never D:\\Hermes Browser\\profile.
+    never the project's profile\\ folder.
 """
 from __future__ import annotations
 
