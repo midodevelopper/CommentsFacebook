@@ -360,6 +360,16 @@ def test_sheet_post_5xx_then_success(sheet, no_sleep):
     assert no_sleep == [5]
 
 
+@pytest.mark.parametrize("status", [404, 429])
+def test_sheet_post_transient_404_and_429_are_retried(sheet, no_sleep, status):
+    """Seen in RUN6: Google answered 404 «يتعذر فتح الملف في الوقت الحالي» after 110 good requests; a ping
+    seconds later worked. It used to stop the group on the first attempt."""
+    sheet.queue(status=status, body="<html>عذرًا، يتعذر فتح الملف في الوقت الحالي.</html>", content_type="text/html")
+    sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
+    assert scraper.sheet_post({"token": "t"}) == '{"ok":true,"posts_new":1}'
+    assert len(sheet.requests) == 2 and no_sleep == [5]
+
+
 def test_sheet_post_4xx_not_retried(sheet, no_sleep):
     sheet.respond(status=403, body="forbidden")
     with pytest.raises(SystemExit) as exc:

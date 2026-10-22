@@ -220,6 +220,9 @@ def sheet_post_payload(group_id: str, post: dict, comments: list[dict]) -> dict:
 # إعادة المحاولة آمنة: الشيت بيعمل upsert بـ post_id / comment_id، فمفيش تكرار.
 SHEET_ATTEMPTS = 3
 SHEET_BACKOFF = (5, 15)
+# 404 «يتعذر فتح الملف في الوقت الحالي» عابر من Google وقت الضغط (RUN6: بعد 110 طلب ناجح، والـ ping بعدها
+# بثواني نجح) — كان بيوقف الجروب. 429 = طلبات كتير. الاتنين بيتعادوا زي 5xx؛ 403 والتوكن الغلط لأ.
+SHEET_RETRY_4XX = (404, 429)
 
 
 def apps_script_error(page: str) -> str:
@@ -244,7 +247,7 @@ def sheet_post(payload: dict) -> str:
                 answer = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             detail = apps_script_error(exc.read().decode("utf-8", "replace"))
-            if exc.code < 500 or attempt == SHEET_ATTEMPTS:
+            if (exc.code < 500 and exc.code not in SHEET_RETRY_4XX) or attempt == SHEET_ATTEMPTS:
                 raise SystemExit(f"الشيت رفض الإرسال HTTP {exc.code} (محاولة {attempt}): {detail}") from exc
             problem = f"HTTP {exc.code}: {detail}"
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
