@@ -46,3 +46,7 @@ groups.txt
 # ذاكرة Claude المنقولة: فيها معرفات جروبات و ID الشيت (الريبو عام)
 # Claude project memory copy: holds real group ids and the Sheet id (public repo)
 memory/
+
+# إعدادات Claude Code المحلية للجهاز (مش للريبو)
+# Machine-local Claude Code settings
+.claude/settings.local.json
