@@ -608,8 +608,8 @@ def test_archive_group_return_contract(flow):
     assert out["posts_shortfall"] is True
 
 
-def test_archive_group_name_comes_from_last_visited_page_title(flow):
-    """Characterization (defect D-09): group_name is the first '|' part of the LAST POST page title."""
+def test_archive_group_name_falls_back_to_page_title(flow):
+    """No h1 (FakeTitlePage has no DOM): group_name is the first '|' part of the page title."""
     calls, data = flow
     data.update({"11": 0})
     out = scraper.archive_group(FakeTitlePage("آخر منشور | الجروب | Facebook"),
@@ -907,6 +907,9 @@ def test_normalize_fb_time_unparseable_kept_as_is(text):
     ("(12) Group", "Group"),
     ("Facebook", ""),
     ("", ""),
+    # live 2026-10-22: RUN6 stored «(20+) name» for 30 groups — the counter can carry a «+»
+    ("(20+) اسم الجروب | Facebook", "اسم الجروب"),
+    ("(20+) Facebook", ""),                       # unavailable group: no name, not «Facebook»
 ])
 def test_clean_title(title, expected):
     assert scraper.clean_title(title) == expected
@@ -1161,3 +1164,98 @@ class CounterPage:
                                          ("1.2K", None), ("", None)])
 def test_comment_total_reads_exact_counts_only(text, total):
     assert scraper.comment_total(CounterPage(text)) == total
+
+
+# ---------------------------------------------------------------- account blocked (S7) + --resume (S5)
+
+class UrlPage:
+    def __init__(self, url, cookies=("c_user", "xs")):
+        self.url = url
+        self.context = self
+        self._cookies = [{"name": n} for n in cookies]
+
+    def cookies(self, _url):
+        return self._cookies
+
+
+@pytest.mark.parametrize("url, blocked", [
+    ("https://www.facebook.com/groups/1/posts/2/", False),
+    ("https://www.facebook.com/login/?next=https%3A%2F%2Fwww.facebook.com%2Fgroups%2F1", True),
+    ("https://www.facebook.com/login.php?next=x", True),
+    ("https://www.facebook.com/checkpoint/1501092823525282/?next=x", True),
+    ("https://www.facebook.com/two_step_verification/authentication/", True),
+    ("https://www.facebook.com/groups/loginhelp", False),        # a group id that only starts with "login"
+    ("https://www.facebook.com/loginhelp", False),
+])
+def test_account_problem_by_url(url, blocked):
+    assert bool(scraper.account_problem(UrlPage(url))) is blocked
+
+
+def test_account_problem_when_the_session_cookie_is_gone():
+    assert "c_user" in scraper.account_problem(UrlPage("https://www.facebook.com/groups/1", cookies=("datr",)))
+
+
+def test_stop_if_account_blocked_raises_a_distinct_exit_code():
+    with pytest.raises(scraper.AccountBlocked) as info:
+        scraper.stop_if_account_blocked(UrlPage("https://www.facebook.com/checkpoint/1/"))
+    assert info.value.code == scraper.ACCOUNT_EXIT and isinstance(info.value, SystemExit)
+
+
+def worker_cmd(code, sleep=0.0):
+    return [sys.executable, "-c", f"import time; print('w'); time.sleep({sleep}); raise SystemExit({code})"]
+
+
+def run_workers(monkeypatch, tmp_path, plan, workers):
+    """plan: group id -> (exit code, seconds). Real child processes, no browser."""
+    monkeypatch.setattr(scraper, "DUMP_DIR", tmp_path)
+    monkeypatch.setattr(scraper, "child_args", lambda args, url, stamp: worker_cmd(*plan[scraper.group_key(url)]))
+    args = parse(monkeypatch, *BASE, "--workers", str(workers))
+    args.group = [f"https://www.facebook.com/groups/{g}" for g in plan]
+    code = scraper.run_parallel(args, "20261023-000000")
+    return code, json.loads((tmp_path / "run-20261023-000000.json").read_text(encoding="utf-8"))
+
+
+def test_workers_one_blocked_account_stops_the_whole_run(monkeypatch, tmp_path):
+    t = __import__("time").time()
+    code, summary = run_workers(monkeypatch, tmp_path, {"1": (scraper.ACCOUNT_EXIT, 0.5), "2": (0, 60),
+                                                         "3": (0, 0)}, workers=2)
+    by = {o["group"]: o for o in summary["groups"]}
+    assert code == scraper.ACCOUNT_EXIT and summary["account_blocked"] is True
+    assert by["1"]["exit"] == scraper.ACCOUNT_EXIT
+    assert by["2"]["exit"] not in (0, None) and "another worker" in by["2"]["last_line"]   # terminated, not 60 s
+    assert by["3"]["exit"] is None and "not started" in by["3"]["last_line"]
+    assert __import__("time").time() - t < 30
+
+
+def test_workers_an_ordinary_group_failure_does_not_stop_the_others(monkeypatch, tmp_path):
+    code, summary = run_workers(monkeypatch, tmp_path, {"1": (1, 0), "2": (0, 0), "3": (0, 0)}, workers=2)
+    assert code == 1 and summary["account_blocked"] is False
+    assert [o["exit"] for o in summary["groups"]] == [1, 0, 0]
+
+
+def test_finished_groups_reads_a_workers_summary(monkeypatch, tmp_path):
+    monkeypatch.setattr(scraper, "DUMP_DIR", tmp_path)
+    (tmp_path / "run-S.json").write_text(json.dumps({"groups": [
+        {"group": "1", "exit": 0}, {"group": "2", "exit": 1}, {"group": "3", "exit": None}]}), encoding="utf-8")
+    assert scraper.finished_groups("S") == {"1"}
+
+
+def test_finished_groups_reads_a_sequential_summary(monkeypatch, tmp_path):
+    monkeypatch.setattr(scraper, "DUMP_DIR", tmp_path)
+    (tmp_path / "run-S.json").write_text(json.dumps([{"group_id": "1", "posts": []},
+                                                     {"failed": "SystemExit: x"}]), encoding="utf-8")
+    assert scraper.finished_groups("S") == {"1"}
+
+
+def test_finished_groups_missing_summary_stops(monkeypatch, tmp_path):
+    monkeypatch.setattr(scraper, "DUMP_DIR", tmp_path)
+    with pytest.raises(SystemExit, match="--resume"):
+        scraper.finished_groups("nope")
+
+
+def test_resume_skips_finished_groups_and_returns_when_nothing_is_left(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(scraper, "DUMP_DIR", tmp_path)
+    (tmp_path / "run-S.json").write_text(json.dumps({"groups": [{"group": "1", "exit": 0}]}), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["fb_groups_to_sheet.py", *BASE, "--resume", "S"])
+    scraper.main()                                    # group 1 is the only group and it finished: no browser
+    assert "فاضل 0" in capsys.readouterr().err

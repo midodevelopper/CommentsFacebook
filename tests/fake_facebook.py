@@ -97,6 +97,10 @@ class Group:
     notification_links: list[str] = field(default_factory=list)
     private: bool = False                 # live 2026-10-21: private group, account not a member
     sort_label: str = "فرز موجز المجموعة: المنشورات الجديدة"
+    # live 2026-10-22: the group name is the only h1 in role=main; the title carries the notification
+    # counter («(20+) name | Facebook») once it has loaded
+    name: str = ""
+    title: str | None = None
 
 
 _CSS = """
@@ -361,6 +365,7 @@ const main = document.body.appendChild(document.createElement('div'));
 main.setAttribute('role', 'main');
 function render() {
   main.replaceChildren();
+  if (D.name) { const h = document.createElement('h1'); h.textContent = D.name; main.append(h); }
   const sortBtn = document.createElement('div');
   sortBtn.setAttribute('role', 'button');
   sortBtn.textContent = D.sort_label;
@@ -457,7 +462,7 @@ class FakeFacebook:
         if match and match.group(1) in self.groups:
             group = self.groups[match.group(1)]
             route.fulfill(status=200, content_type="text/html; charset=utf-8",
-                          body=_page(f"{group.group_id} | Facebook", group.__dict__, _FEED_JS))
+                          body=_page(group.title or f"{group.group_id} | Facebook", group.__dict__, _FEED_JS))
             return
         route.fulfill(status=404, content_type="text/html; charset=utf-8",
                       body="<!doctype html><title>Not found</title><div role='main'>404</div>")

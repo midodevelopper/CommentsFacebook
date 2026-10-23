@@ -25,6 +25,42 @@ def ids(cs):
 
 # ---------------------------------------------------------------- collect_post_ids
 
+def test_group_name_from_h1_not_the_counter_title(page, fake_fb):
+    """Live 2026-10-22: the title read «(20+) name | Facebook» on 22/32 groups; the h1 is exact."""
+    fake_fb.add_group(Group(G, name="اسم الجروب", title="(20+) اسم الجروب | Facebook"), [Post("1001")])
+    scraper.collect_post_ids(page, G, 1)
+    assert scraper.group_name(page) == "اسم الجروب"
+
+
+def test_group_name_without_h1_strips_the_counter(page, fake_fb):
+    fake_fb.add_group(Group(G, title="(20+) اسم الجروب | Facebook"), [Post("1001")])
+    scraper.collect_post_ids(page, G, 1)
+    assert scraper.group_name(page) == "اسم الجروب"
+
+
+def test_group_name_ignores_h1_in_a_dialog(page, fake_fb):
+    fake_fb.add_group(Group(G, title="(3) اسم الجروب | Facebook"), [Post("1001")])
+    scraper.collect_post_ids(page, G, 1)
+    page.evaluate("""() => { const d = document.querySelector("div[role='main']")
+        .appendChild(document.createElement('div')); d.setAttribute('role', 'dialog'); d.innerHTML = '<h1>الإشعارات</h1>'; }""")
+    assert scraper.group_name(page) == "اسم الجروب"
+
+
+def test_logged_out_feed_stops_the_run_instead_of_an_empty_group(page, fake_fb):
+    """S7: without c_user every group would come back empty, one by one; stop the run instead."""
+    fake_fb.add_group(Group(G), [Post("1001")])
+    page.context.clear_cookies()
+    with pytest.raises(scraper.AccountBlocked):
+        scraper.collect_post_ids(page, G, 1)
+
+
+def test_logged_out_post_stops_the_run(page, fake_fb):
+    fake_fb.add_group(Group(G), [Post("1001", comments=comments(2))])
+    page.context.clear_cookies()
+    with pytest.raises(scraper.AccountBlocked):
+        scraper.scrape_post(page, G, "1001", 0, 10)
+
+
 def test_collect_requests_chronological_feed(page, fake_fb):
     fake_fb.add_group(Group(G), [Post("1001"), Post("1002")])
     scraper.collect_post_ids(page, G, 2)

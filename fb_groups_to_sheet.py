@@ -166,11 +166,34 @@ def normalize_fb_time(text: str, now: dt.datetime | None = None) -> str:
 
 
 def clean_title(title: str) -> str:
-    """«(2) اسم الجروب | Facebook» -> «اسم الجروب». الـ (2) عدد الإشعارات مش جزء من الاسم."""
-    parts = [p.strip() for p in (title or "").split("|")]
+    """«(2) اسم الجروب | Facebook» -> «اسم الجروب». الـ (2) / (20+) عدد الإشعارات مش جزء من الاسم.
+    العدد بيتشال **قبل** ما «Facebook» تتشال، فجروب مش متاح («(20+) Facebook») يطلع من غير اسم."""
+    parts = [re.sub(r"^\(\d+\+?\)\s*", "", p.strip()).strip() for p in (title or "").split("|")]
     parts = [p for p in parts if p and p != "Facebook"]
-    name = parts[0] if parts else ""
-    return re.sub(r"^\(\d+\)\s*", "", name).strip()
+    return parts[0] if parts else ""
+
+
+# اسم الجروب = الـ h1 الوحيد في عمود المحتوى (31/31 جروب متاح، 2026-10-22). العنوان فيه عدد الإشعارات
+# («(20+) …») على 22 من 32، وكان بيتخزن كده في RUN6.
+GROUP_NAME_JS = r"""() => {
+  const h = [...document.querySelectorAll("div[role='main'] h1")]
+    .find(e => !e.closest("[role='dialog'], [role='banner']"));
+  return h ? (h.innerText || h.textContent || '').trim() : '';
+}"""
+
+
+def group_name(page) -> str:
+    """الـ h1 الأول، والعنوان (من غير عدد الإشعارات) لو مفيش h1."""
+    try:
+        name = page.evaluate(GROUP_NAME_JS) or ""
+    except Exception:
+        name = ""
+    if name:
+        return name
+    try:
+        return clean_title(page.title())
+    except Exception:
+        return ""
 
 
 def without_token(payload: dict) -> dict:
@@ -418,6 +441,7 @@ def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], st
         )
         # الموجز بيترسم بعد DOMContentLoaded: لحد ما يظهر منشور من الجروب أو يبان إنه خاص (4 ث بالكتير زي الأول)
         wait_until(page, lambda: bool(feed_post_ids(page, group_id)) or group_is_private_for_us(page), 4000)
+        stop_if_account_blocked(page)
         if group_is_private_for_us(page):
             print(f"الجروب {group_id} خاص والحساب مش عضو فيه — مفيش منشورات نقدر نشوفها", file=sys.stderr)
             return [], ""
@@ -975,6 +999,40 @@ GOTO_ATTEMPTS = 3
 HEADER_ROUNDS = 8
 
 
+# تسجيل خروج أو checkpoint = مشكلة في الحساب نفسه، مش في الجروب. التشغيل كله بيقف (كل الـ workers)،
+# عشان النوافذ التانية ماتفضلش تحمّل صفحات فيسبوك على حساب متعلّم عليه.
+ACCOUNT_EXIT = 3
+BLOCKED_URL_RE = re.compile(r"facebook\.com/(?:login|checkpoint|two_step_verification|recover)(?:[/.?#]|$)", re.I)
+
+
+class AccountBlocked(SystemExit):
+    def __init__(self, reason: str):
+        super().__init__(ACCOUNT_EXIT)
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return f"account-blocked: {self.reason}"
+
+
+def account_problem(page) -> str:
+    """سبب لو الحساب مش في حالة يقدر يسحب فيها (اتحوّل لصفحة دخول/checkpoint، أو الكوكي c_user راح)."""
+    url = page.url or ""
+    if BLOCKED_URL_RE.search(url):
+        return f"redirected to {url.split('?')[0]}"
+    try:
+        names = {c["name"] for c in page.context.cookies("https://www.facebook.com")}
+    except Exception:
+        return ""
+    return "" if "c_user" in names else "no c_user cookie (logged out)"
+
+
+def stop_if_account_blocked(page) -> None:
+    reason = account_problem(page)
+    if reason:
+        print(f"ACCOUNT-BLOCKED: {reason} — التشغيل كله بيقف", file=sys.stderr, flush=True)
+        raise AccountBlocked(reason)
+
+
 def goto_with_retry(page, url: str) -> None:
     """فتح الصفحة قراءة بس فإعادة المحاولة آمنة. timeout واحد (60 ث) كان بيوقف جروب كامل."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -982,6 +1040,7 @@ def goto_with_retry(page, url: str) -> None:
     for attempt in range(1, GOTO_ATTEMPTS + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            stop_if_account_blocked(page)
             return
         except PlaywrightTimeout:
             if attempt == GOTO_ATTEMPTS:
@@ -1144,11 +1203,7 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
     group_id = group_key(url)
     post_ids, feed_sort = collect_post_ids(page, group_id, max_posts)
     # اسم الجروب من صفحة الموجز نفسها، قبل ما نفتح أي منشور
-    name = ""
-    try:
-        name = clean_title(page.title())
-    except Exception:
-        name = ""
+    name = group_name(page)
     posts = []
     unavailable: list[str] = []
     sort_skipped: list[str] = []
@@ -1298,6 +1353,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=200, help="أقصى عدد تعليقات في طلب واحد للشيت")
     parser.add_argument("--workers", type=int, default=1,
                         help="كام جروب في نفس الوقت، كل واحد في نافذة لوحده (عملية بايثون لكل جروب)")
+    parser.add_argument("--resume", metavar="STAMP", default=None,
+                        help="كمّل تشغيل وقف: اتعدّى الجروبات اللي خلصت في dumps/run-STAMP.json")
     parser.add_argument("--debug", action="store_true",
                         help="سجّل الكونسول والأخطاء والشبكة، واحفظ HTML وصورة في debug/ لو حصل خطأ")
     parser.add_argument("--trace", action="store_true",
@@ -1371,6 +1428,9 @@ def run_parallel(args: argparse.Namespace, stamp: str) -> int:
     lock = threading.Lock()
     total = len(args.group)
     started = time.time()
+    # حساب متعلّم عليه (ACCOUNT_EXIT من أي worker): مفيش جروب جديد بيبدأ، واللي شغالين بيتقفلوا
+    halt = threading.Event()
+    running: set = set()
 
     def say(text: str) -> None:
         with lock:
@@ -1379,10 +1439,14 @@ def run_parallel(args: argparse.Namespace, stamp: str) -> int:
     def one(index_url: tuple[int, str]) -> dict:
         index, url = index_url
         key = group_key(url)
+        with lock:
+            if halt.is_set():
+                return {"group": key, "url": url, "exit": None, "seconds": 0, "last_line": "not started: account blocked"}
+            proc = subprocess.Popen(child_args(args, url, stamp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace")
+            running.add(proc)
         say(f"[{index}/{total}] {key}: start")
         t = time.time()
-        proc = subprocess.Popen(child_args(args, url, stamp), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace")
         last = ""
         for line in proc.stdout:
             line = line.rstrip()
@@ -1390,8 +1454,21 @@ def run_parallel(args: argparse.Namespace, stamp: str) -> int:
                 last = line
                 say(f"[{key}] {line}")
         code = proc.wait()
+        stopped = False
+        with lock:
+            running.discard(proc)
+            stopped = halt.is_set() and code != ACCOUNT_EXIT
+            if code == ACCOUNT_EXIT and not halt.is_set():
+                halt.set()
+                for other in running:
+                    other.terminate()
         sec = round(time.time() - t, 1)
-        say(f"[{index}/{total}] {key}: {'ok' if code == 0 else f'FAILED exit {code}'} in {sec} s")
+        if code == ACCOUNT_EXIT:
+            say(f"[{index}/{total}] {key}: ACCOUNT BLOCKED in {sec} s — stopping every worker")
+        else:
+            say(f"[{index}/{total}] {key}: {'ok' if code == 0 else f'FAILED exit {code}'} in {sec} s")
+        if stopped:
+            last = "stopped: account blocked in another worker"
         return {"group": key, "url": url, "exit": code, "seconds": sec, "last_line": "" if code == 0 else last}
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -1407,14 +1484,29 @@ def run_parallel(args: argparse.Namespace, stamp: str) -> int:
                 pass
     summary = DUMP_DIR / f"run-{stamp}.json"
     summary.write_text(json.dumps({"workers": args.workers, "seconds": round(time.time() - started, 1),
-                                   "groups": outcomes}, ensure_ascii=False, indent=2), encoding="utf-8")
+                                   "account_blocked": halt.is_set(), "groups": outcomes},
+                                  ensure_ascii=False, indent=2), encoding="utf-8")
     for part in parts:
         part.unlink()
     failed = [o for o in outcomes if o["exit"] != 0]
     print(f"done {summary}: {total - len(failed)}/{total} groups ok in {round(time.time() - started, 1)} s")
     for o in failed:
         print(f"  FAILED {o['group']}: {o['last_line']}", file=sys.stderr)
+    if halt.is_set():
+        print(f"ACCOUNT BLOCKED: التشغيل وقف. كمّل بعد ما الحساب يرجع بـ --resume {stamp}", file=sys.stderr)
+        return ACCOUNT_EXIT
     return 1 if failed else 0
+
+
+def finished_groups(stamp: str) -> set[str]:
+    """الجروبات اللي خلصت في run-<stamp>.json (تشغيل عادي أو workers)."""
+    path = DUMP_DIR / f"run-{stamp}.json"
+    if not path.exists():
+        raise SystemExit(f"--resume: مفيش {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        return {o["group"] for o in data.get("groups", []) if o.get("exit") == 0}
+    return {r["group_id"] for r in data if isinstance(r, dict) and r.get("group_id") and "failed" not in r}
 
 
 def safe_name(text: str) -> str:
@@ -1426,6 +1518,12 @@ def main() -> None:
     args = parse_args()
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = args.run_stamp or time.strftime("%Y%m%d-%H%M%S")
+    if args.resume:
+        done = finished_groups(args.resume)
+        args.group = [url for url in args.group if group_key(url) not in done]
+        print(f"--resume {args.resume}: {len(done)} جروب خلص قبل كده، فاضل {len(args.group)}", file=sys.stderr)
+        if not args.group:
+            return
     if args.workers > 1 and len(args.group) > 1:
         raise SystemExit(run_parallel(args, stamp))
     from playwright.sync_api import sync_playwright

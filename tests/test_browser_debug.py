@@ -55,7 +55,7 @@ def test_defaults():
 @pytest.mark.unit
 def test_probes_are_well_formed():
     names = [p["name"] for p in bd.PROBES]
-    assert len(names) == len(set(names)) == 43
+    assert len(names) == len(set(names)) == 44
     for p in bd.PROBES:
         assert p["kind"] in ("css", "role", "text")
         assert p["tier"] in ("critical", "degraded", "context")

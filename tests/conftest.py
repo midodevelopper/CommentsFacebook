@@ -208,6 +208,8 @@ def fake_fb(context):
 
     fb = FakeFacebook()
     fb.install(context)
+    # logged in, like the real profile: the scraper stops the run when c_user is gone (account_problem)
+    context.add_cookies([{"name": "c_user", "value": "100000000000777", "domain": ".facebook.com", "path": "/"}])
     return fb
 
 
