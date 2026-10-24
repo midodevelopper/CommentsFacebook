@@ -47,6 +47,15 @@ groups.txt
 # Claude project memory copy: holds real group ids and the Sheet id (public repo)
 memory/
 
+# مفاتيح وإعدادات خاصة (مفتاح الكتابة، مفتاح الأدمن، معرفات الشيت والسكربت والنشر) — الريبو عام
+# Private keys and config (ingest/admin keys, Sheet/script/deployment ids) — public repo
+.secrets/
+
+# إعداد clasp (فيه scriptId) وفولدر التجهيز اللي بيتولّد قبل كل push
+# clasp project file (holds the scriptId) and the generated push staging folder
+apps_script/.clasp.json
+apps_script/push/
+
 # إعدادات Claude Code المحلية للجهاز (مش للريبو)
 # Machine-local Claude Code settings
 .claude/settings.local.json
