@@ -3,8 +3,32 @@
 **Revision 3 — 2026-10-24.** Replaces revision 2 in place. Revision 2's verified facts and owner decisions are
 kept unless a section says why they changed.
 
-**Status: execution started 2026-10-24 on the owner's order** ("start execution of plan from start to end now").
-Live progress is in `dumps/plan-exec/state.json`; the final outcome is written here by phase F.
+**Status: executed 2026-10-24 on the owner's order** ("start execution of plan from start to end now").
+Per-phase evidence is in `dumps/plan-exec/` (private).
+
+| Phase | Result |
+|---|---|
+| B0, E, P0, P1, P2, PX | passed (offline; final full suite 675 passed, 3 skipped live opt-ins) |
+| P3 | passed after the owner enabled the Apps Script API user setting (push was refused before; reads had worked without it) |
+| P4 | passed: 14/14 scenarios on fresh real copies, after fixing five Google behaviours the fake hid; production proven unchanged |
+| P5 | passed: all 6 public deployments on v2, drained, Backup A verified, migrated and verified twice, default tab deleted, gate reopened |
+| P6 | passed: live smoke scrape wrote 2 posts correctly. Comment capture was not exercised (newest posts had none). |
+| P7 | dry-run passed; the send step is blocked by F-B2 (no authorized draft; the server blocks all 112 legacy rows) |
+| F | this record |
+
+**Outcome flags:**
+
+| Flag | Value |
+|---|---|
+| implementation_complete | true |
+| rehearsal_verified | true |
+| migration_verified | true |
+| live_scraping_verified | true (posts; comment capture not exercised live) |
+| reply_dry_run_verified | true |
+| reply_sending_verified | false (F-B2) |
+| nested_reply_targets | disabled (no nesting evidence measured) |
+| post_replies | disabled |
+| dashboard_visual / slicer behaviour | unverified (owner should look at it) |
 
 > The repo is public. This file contains no Sheet ID, script ID, deployment ID, group ID, token, key, email
 > address, author ID or reply text. Private values live only in git-ignored files (§6.4).

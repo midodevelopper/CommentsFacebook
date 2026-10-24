@@ -1395,7 +1395,7 @@ def read_groups_file(path: Path) -> list[str]:
 
 NO_LIMIT = 10 ** 9
 # حد صاحب المشروع (2026-10-22): أكتر من 4 نوافذ بتسحب في نفس الوقت = خطر حظر الحساب من فيسبوك
-MAX_WORKERS = 6
+MAX_WORKERS = 4
 
 
 def comment_limit(value: str) -> int:

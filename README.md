@@ -56,23 +56,24 @@ curl http://127.0.0.1:9333/json/version
 
 ---
 
-## الإعداد (Google Sheet)
+## الإعداد (Google Sheet) — API v2
 
-1. افتح Google Sheet جديد > Extensions > Apps Script.
-2. الصق `facebook_sheet_receiver.gs` وحدّث `TOKEN` فيه بقيمة سرية من عندك.
-3. شغّل `setup()` مرة واحدة لتكوين تابّات `Posts` و `Comments`.
-4. Deploy > New deployment > Web app — Execute as: **Me**، Who has access: **Anyone**.
-5. انسخ رابط الـ `/exec` وحطه في متغيرات البيئة:
+الكود في `apps_script/src/` (المستقبل + الترحيل والداشبورد)، وبيتنشر بـ clasp من `tools/plan_exec/` (شوف
+`ENHANCEMENT_PLAN.md`). **مفيش رابط ولا مفتاح في الكود**: كل الكتابة محتاجة مفاتيح خاصة، والهاش بتاعها بس
+بيتنشر في `zz_config.gs` المتولّد (برّه git).
 
-```powershell
-$env:FB_SHEET_WEBAPP = "https://script.google.com/macros/s/XXXX/exec"
-$env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
-```
+الإعداد المحلي (برّه git) في `.secrets/`:
 
-شوف `.env.example`.
+| الملف | فيه |
+| --- | --- |
+| `config.json` | `webapp` (رابط `/exec`)، `sheet_id`، `script_id` |
+| `ingest.key` | مفتاح الكتابة بتاع السحب |
+| `admin.key` | مفتاح الأدمن بتاع الردود والترحيل |
 
-> نشر الـ Web App بـ *Anyone* معناه إن الرابط + التوكن هما كل الحماية.
-> ممنوع ترفعهم في ريبو عام.
+أو من البيئة: `FB_SHEET_WEBAPP`، `FB_SHEET_INGEST_KEY`، `FB_SHEET_ADMIN_KEY`، `FB_SHEET_ID`.
+
+> clasp محتاج «Google Apps Script API» شغال من https://script.google.com/home/usersettings بحساب صاحب الشيت —
+> القراءة بتشتغل من غيره، بس الـ push لأ.
 
 ---
 
@@ -109,14 +110,17 @@ $env:FB_SHEET_TOKEN  = "نفس التوكن اللي في الـ gs"
 
 ## الرد من الشيت
 
-املأ عمود `reply` في تاب `Comments`، وبعدين:
+اكتب الرد في عمود `reply` في تاب `Comments` (الحالة بتبقى `pending`)، وبعدين:
 
 ```powershell
-.venv\Scripts\python.exe fb_return_replies.py
+.venv\Scripts\python.exe fb_return_replies.py --max-replies 5      # فاصل عشوائي 20–60 ث بين الردود
+.venv\Scripts\python.exe fb_return_replies.py --dry-run            # يتأكد من الأهداف من غير ضغط «رد» ولا كتابة
 ```
 
-بياخد الصفوف اللي فيها `reply` و `reply_status` فاضي، ينشر الرد، ويعلّم الصف
-`posted` عن طريق `mark_replied`.
+كل رد: `claim` ← تأكد إنه مش منشور قبل كده ← كتابة ← `prepare_submit` (آخر تصريح من الشيت) ← Enter ← تأكيد صارم
+(من حسابنا، تحت التعليق نفسه، نفس النص) ← الحالة. الحالات: `pending`، `sending`، `sent`، `uncertain` (اتبعت
+ومااتأكدش — مابيتبعتش تاني من غير مطابقة)، `replied`، `declined` (منع تواصل دايم مع الشخص)، `failed`، `held`
+(مسودات قديمة مش مصرّح بيها — مابتتبعتش). الرد على رد والرد على منشور مقفولين.
 
 ---
 
@@ -228,7 +232,9 @@ with recording(page, "post-123") as rec:   # دَمب تلقائي لو حصل �
 | `fb_groups_to_sheet.py` | السحب: جروب > منشورات > تعليقات > الشيت |
 | `fb_return_replies.py` | الرد: الشيت > تعليقات فيسبوك |
 | `browser_debug.py` | التشخيص: HTML، كونسول، أخطاء، شبكة، صور |
-| `facebook_sheet_receiver.gs` | Apps Script اللي بيستقبل ويعمل upsert بدون تكرار |
+| `apps_script/src/` | Apps Script v2: المستقبل، الترحيل، الداشبورد (المنشور حاليًا) |
+| `facebook_sheet_receiver.gs` | Apps Script v1 القديم — مفيش نشر بيستخدمه بعد 2026-10-24 (للتاريخ والاختبارات) |
+| `tools/plan_exec/` | منفّذ الخطة: الحالة، clasp، النشر، التجربة |
 | `cdp-ready.html` | صفحة البداية في النافذة المتحكَّم فيها |
 | `CLAUDE.md` | دليل المشروع وسجل التحديثات |
 | `dumps/` | مخرجات JSON محلية (مستبعدة من الريبو) |
