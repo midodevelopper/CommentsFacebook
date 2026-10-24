@@ -29,15 +29,43 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
-WEBAPP = (
-    "https://script.google.com/macros/s/"
-    "AKfycbxk49tkf3Q5B5Nv58DcGqrz1_EGrPAbo65PRap9J3EBDnXfpX1W1bCFK868hNGIM4mc3Q/exec"
-)
-TOKEN = os.environ.get("FB_SHEET_TOKEN", "CommentSecrets")
+ROOT = Path(__file__).resolve().parent
+SECRETS = ROOT / ".secrets"
 CDP = os.environ.get("FB_CDP", "http://127.0.0.1:9333")
-DUMP_DIR = Path(__file__).resolve().parent / "dumps"
+DUMP_DIR = ROOT / "dumps"
+
+
+def _private(name: str, env: str, key: str | None = None) -> str:
+    """رابط الـ web app ومفتاح الكتابة من البيئة أو .secrets/ (برّه git). مفيش قيمة في الكود: الريبو عام."""
+    if os.environ.get(env):
+        return os.environ[env]
+    path = SECRETS / name
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8").strip()
+    return json.loads(text).get(key, "") if key else text
+
+
+WEBAPP = _private("config.json", "FB_SHEET_WEBAPP", "webapp")
+INGEST_KEY = _private("ingest.key", "FB_SHEET_INGEST_KEY")
+PLAN_LOCK = DUMP_DIR / "plan-exec" / "run.lock"
+
+
+def check_plan_lock() -> None:
+    """منفّذ الخطة شغال (ترحيل/نشر) = مفيش سحب ولا ردود. PLAN_EXEC_ALLOW=1 للعمليات اللي هو نفسه بيشغّلها."""
+    if os.environ.get("PLAN_EXEC_ALLOW") == "1" or not PLAN_LOCK.exists():
+        return
+    try:
+        from tools.plan_exec import lock as planlock
+
+        info = planlock.read(PLAN_LOCK)
+        if info and not planlock.is_stale(info):
+            raise SystemExit(4)
+    except ImportError:
+        return
 
 GROUP_RE = re.compile(r"facebook\.com/groups/([^/?#]+)", re.I)
 POST_RE = re.compile(r"/groups/[^/]+/(?:posts|permalink)/(\d+)")
@@ -197,11 +225,21 @@ def group_name(page) -> str:
 
 
 def without_token(payload: dict) -> dict:
-    """نسخة للحفظ على الديسك: التوكن مالوش لازمة في الدَمب."""
-    return {k: v for k, v in payload.items() if k != "token"}
+    """نسخة للحفظ على الديسك: المفتاح مالوش لازمة في الدَمب."""
+    return {k: v for k, v in payload.items() if k not in ("token", "auth")}
 
 
-def sheet_comment(comment: dict, post_content: str = "") -> dict:
+def iso_time(value: str) -> str:
+    """«YYYY-MM-DD HH:MM» (توقيت الجهاز وقت السحب) -> ISO 8601 بالـ offset. أي حاجة تانية -> فاضي."""
+    try:
+        return dt.datetime.strptime(value or "", "%Y-%m-%d %H:%M").astimezone().isoformat(timespec="seconds")
+    except ValueError:
+        return ""
+
+
+def sheet_comment(comment: dict) -> dict:
+    """تعليق بصيغة v2. مفيش reply ولا reply_status: السحب مابيكتبش في أعمدة الرد خالص."""
+    mentions = comment.get("mentions") or []
     return {
         "comment_id": comment.get("comment_id") or "",
         "parent_id": comment.get("parent_id") or comment.get("parent_comment_id") or "",
@@ -212,30 +250,36 @@ def sheet_comment(comment: dict, post_content: str = "") -> dict:
         "author_id": comment.get("author_id") or "",
         "author_url": comment.get("author_url") or "",
         "text": comment.get("text") or "",
-        "created_time": comment.get("created_time") or "",
-        "permalink": comment.get("permalink") or "",
-        "post content": post_content or comment.get("post content") or comment.get("post_content") or "",
-        "reply": comment.get("reply") or "",
-        "reply_status": comment.get("reply_status") or "",
+        "created_time": iso_time(comment.get("created_time") or ""),
+        "url": comment.get("permalink") or comment.get("url") or "",
+        "nest_parent_id": comment.get("nest_parent_id") or "",
+        "mentions": [m for m in mentions if str(m).isdigit()],
+        "moderation": comment.get("moderation") or "",
     }
 
 
-def sheet_post_payload(group_id: str, post: dict, comments: list[dict]) -> dict:
+def sheet_post_payload(group_id: str, post: dict, comments: list[dict], group_name: str = "", account_id: str = "") -> dict:
     return {
-        "token": TOKEN,
-        "group_id": group_id,
-        "posts": [{
-            "post_id": post.get("post_id"),
-            "author": post.get("author") or "",
-            "author_id": post.get("author_id") or "",
-            "text": post.get("text") or post.get("post_content") or "",
-            "post content": post.get("post_content") or post.get("text") or "",
-            "created_time": post.get("created_time") or "",
-            "url": post.get("url") or post.get("permalink") or "",
-            "permalink": post.get("permalink") or post.get("url") or "",
-            "comment_sort": post.get("comment_sort") or "الأحدث",
-            "comments": [sheet_comment(c, post.get("post_content") or post.get("text") or "") for c in comments],
-        }],
+        "api_version": 2,
+        "action": "ingest",
+        "auth": {"kind": "ingest", "key": INGEST_KEY},
+        "payload": {
+            "group_id": group_id,
+            "account_id": account_id,
+            "posts": [{
+                "post_id": post.get("post_id"),
+                "group_name": group_name,
+                "author": post.get("author") or "",
+                "author_id": post.get("author_id") or "",
+                "text": post.get("text") or "",
+                # رابط/ميديا حقيقية بس — نص المنشور مابيتكرّرش هنا (قرار Q3)
+                "media_url": post.get("media_url") or "",
+                "created_time": iso_time(post.get("created_time") or ""),
+                "url": post.get("url") or post.get("permalink") or "",
+                "comment_sort": post.get("comment_sort") or "الأحدث",
+                "comments": [sheet_comment(c) for c in comments],
+            }],
+        },
     }
 
 
@@ -257,6 +301,10 @@ def apps_script_error(page: str) -> str:
 
 
 def sheet_post(payload: dict) -> str:
+    if not WEBAPP or not (payload.get("auth") or {}).get("key"):
+        raise SystemExit("ناقص إعداد الشيت: FB_SHEET_WEBAPP / FB_SHEET_INGEST_KEY أو .secrets/config.json و ingest.key")
+    # نفس request_id في كل إعادة: لو الطلب الأول اتنفّذ وضاع رده، الشيت بيرجّع نفس النتيجة من غير ما يكرّر
+    payload.setdefault("request_id", str(uuid.uuid4()))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     for attempt in range(1, SHEET_ATTEMPTS + 1):
         req = urllib.request.Request(
@@ -285,10 +333,12 @@ def sheet_post(payload: dict) -> str:
                 raise SystemExit(f"رد الشيت مش JSON — غالبًا صفحة خطأ من Apps Script: {apps_script_error(answer)}") from None
             if isinstance(parsed, dict) and parsed.get("ok") is True:
                 return answer
-            busy = isinstance(parsed, dict) and "lock" in str(parsed.get("error", "")).lower()
+            # E_LOCK_BUSY / E_INTERNAL بس بيتعادوا؛ الصيانة والـ schema والتحقق = وقفة صريحة
+            code = parsed.get("code", "") if isinstance(parsed, dict) else ""
+            busy = code in ("E_LOCK_BUSY", "E_INTERNAL")
             if not busy or attempt == SHEET_ATTEMPTS:
-                raise SystemExit(f"الشيت رفض البيانات: {answer[:300]}")
-            problem = f"القفل مشغول: {parsed.get('error')}"
+                raise SystemExit(f"الشيت رفض البيانات ({code or 'ok:false'}): {answer[:300]}")
+            problem = f"{code}: {parsed.get('error')}"
         wait = SHEET_BACKOFF[min(attempt, len(SHEET_BACKOFF)) - 1]
         print(f"الشيت مارضيش ({problem[:160]}) — محاولة {attempt + 1} بعد {wait} ثانية", file=sys.stderr)
         time.sleep(wait)
@@ -328,26 +378,31 @@ class SheetSender:
             self.raise_if_failed()
 
     @staticmethod
-    def _comments(payload: dict) -> int:
-        return sum(len(p.get("comments") or []) for p in payload["posts"])
+    def _posts(payload: dict) -> list[dict]:
+        return payload["payload"]["posts"]
+
+    @classmethod
+    def _comments(cls, payload: dict) -> int:
+        return sum(len(p.get("comments") or []) for p in cls._posts(payload))
 
     def _merged(self, items: list[dict]) -> list[dict]:
         out: list[dict] = []
         for payload in items:
             last = out[-1] if out else None
-            if (last and last.get("group_id") == payload.get("group_id")
-                    and len(last["posts"]) + len(payload["posts"]) <= self.MAX_POSTS
+            if (last and last["payload"].get("group_id") == payload["payload"].get("group_id")
+                    and len(self._posts(last)) + len(self._posts(payload)) <= self.MAX_POSTS
                     and self._comments(last) + self._comments(payload) <= self.batch_size):
-                for post in payload["posts"]:
+                for post in self._posts(payload):
                     # نفس المنشور مرتين في طلب واحد: الشيت بياخد أول مرة بس، فالتعليقات تتضم في واحد
-                    same = next((p for p in last["posts"] if p.get("post_id") == post.get("post_id")), None)
+                    same = next((p for p in self._posts(last) if p.get("post_id") == post.get("post_id")), None)
                     if same:
                         same["comments"] = same["comments"] + list(post.get("comments") or [])
                     else:
-                        last["posts"].append(dict(post, comments=list(post.get("comments") or [])))
+                        self._posts(last).append(dict(post, comments=list(post.get("comments") or [])))
             else:
-                out.append(dict(payload, posts=[dict(p, comments=list(p.get("comments") or []))
-                                                for p in payload["posts"]]))
+                # طلب جديد = request_id جديد (بيتحط وقت الإرسال)
+                body = dict(payload["payload"], posts=[dict(p, comments=list(p.get("comments") or [])) for p in self._posts(payload)])
+                out.append({k: v for k, v in payload.items() if k != "request_id"} | {"payload": body})
         return out
 
     def _run(self) -> None:
@@ -371,7 +426,7 @@ class SheetSender:
                     self.error = exc
                     break
                 self.requests += 1
-                print(f"sheet: {len(payload['posts'])} posts / {self._comments(payload)} comments: {answer[:220]}",
+                print(f"sheet: {len(self._posts(payload))} posts / {self._comments(payload)} comments: {answer[:220]}",
                       flush=True)
 
 
@@ -822,7 +877,19 @@ def visible_snapshot(page, group_id: str, post_id: str) -> dict:
               has_media: [...article.querySelectorAll("img, video")].some(n => !n.closest("div[dir='auto']"))
                 || !!article.querySelector("a[href*='/photo/']"),
               created_time: /[0-9٠-٩]{4}/.test(timeAria) ? timeAria : (timeNode ? (timeNode.innerText || '').trim() : ''),
-              aria_label: article.getAttribute('aria-label') || ''
+              aria_label: article.getAttribute('aria-label') || '',
+              // رد متداخل تحت رد معيّن في الصفحة: id الـ article الأب (دليل «رد على ردنا» — §4.4)
+              nest_parent_id: (() => {
+                const parent = article.parentElement && article.parentElement.closest("div[role='article'][aria-label]");
+                const l = parent && [...parent.querySelectorAll("a[href*='comment_id=']")].find(a => a.closest("div[role='article'][aria-label]") === parent);
+                if (!l) return '';
+                try { const q = new URL(l.href).searchParams; return q.get('reply_comment_id') || q.get('comment_id') || ''; } catch (e) { return ''; }
+              })(),
+              // ids الحسابات المذكورة جوه نص التعليق (مش صاحبه)
+              mentions: [...article.querySelectorAll("div[dir='auto'] a[href*='/user/']")]
+                .filter(a => a.closest("div[role='article'][aria-label]") === article).map(a => userIdFrom(a.href)).filter(Boolean),
+              // «تم الرفض» تحت التعليق: الشيت بيقبلها بس لو التعليق ده ردنا نفسه (sent_reply_id)
+              moderation: /تم الرفض|عرض الملاحظات|Declined/.test(article.textContent || '') ? 'declined' : ''
             });
           });
 
@@ -934,6 +1001,9 @@ def normalize_comment(raw: dict, group_id: str, post_id: str) -> dict | None:
         "has_media": bool(raw.get("has_media")),
         "aria_label": raw.get("aria_label") or "",
         "permalink": permalink,
+        "nest_parent_id": raw.get("nest_parent_id") or "",
+        "mentions": list(raw.get("mentions") or []),
+        "moderation": raw.get("moderation") or "",
     }
 
 
@@ -1214,24 +1284,8 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
         out["posts_sort_skipped"] = list(sort_skipped)
         return out
 
+    account_id = own_account_id(page)
     for post_id in post_ids:
-        def on_batch(comments, batch_index, done):
-            payload = {
-                "token": TOKEN,
-                "group_id": group_id,
-                "posts": [{
-                    "post_id": post_id,
-                    "author": "",
-                    "text": "",
-                    "created_time": "",
-                    "url": f"https://www.facebook.com/groups/{group_id}/posts/{post_id}/",
-                    "permalink": f"https://www.facebook.com/groups/{group_id}/posts/{post_id}/",
-                    "comments": [sheet_comment(c) for c in comments],
-                }],
-            }
-            answer = sheet_post(payload)
-            print(f"sheet batch {batch_index} n={len(comments)} done={done}: {answer[:220]}")
-
         post = scrape_post(
             page,
             group_id,
@@ -1258,7 +1312,7 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
             comments = post.get("comments") or []
             chunks = [comments[i:i + batch_size] for i in range(0, len(comments), batch_size)] or [[]]
             for index, chunk in enumerate(chunks, 1):
-                payload = sheet_post_payload(group_id, post, chunk)
+                payload = sheet_post_payload(group_id, post, chunk, group_name=name, account_id=account_id)
                 if sender:
                     sender.put(payload)
                 else:
@@ -1274,9 +1328,16 @@ def archive_group(page, url: str, min_posts: int, max_posts: int, min_comments: 
     return result()
 
 
+def own_account_id(page) -> str:
+    """c_user: الشيت بيعرف بيه ردودنا وسط التعليقات (رفض فيسبوك لردنا). القيمة مابتتطبعش."""
+    try:
+        return next((c["value"] for c in page.context.cookies("https://www.facebook.com") if c.get("name") == "c_user"), "")
+    except Exception:
+        return ""
+
+
 def _group_result(group_id, name, feed_sort, min_posts, max_posts, min_comments, max_comments, posts) -> dict:
     return {
-        "token": TOKEN,
         "group_id": group_id,
         "group_url": f"https://www.facebook.com/groups/{group_id}",
         "group_name": name,
@@ -1367,8 +1428,8 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("min-posts لازم يكون 1 أو أكتر، وmax-posts أكبر منه أو يساويه")
     if args.min_comments < 0 or args.max_comments < args.min_comments:
         raise SystemExit("min-comments مش سالب، وmax-comments أكبر منه أو يساويه")
-    if args.batch_size < 1:
-        raise SystemExit("batch-size لازم يكون 1 أو أكتر")
+    if not 1 <= args.batch_size <= 500:
+        raise SystemExit("batch-size من 1 لـ 500 (حد الشيت v2 للطلب الواحد)")
     if not 1 <= args.workers <= MAX_WORKERS:
         raise SystemExit(f"workers من 1 لـ {MAX_WORKERS}: أكتر من كده الحساب ممكن يتحظر من فيسبوك (قرار صاحب المشروع)")
     if args.workers > 1 and args.debug:
@@ -1516,6 +1577,7 @@ def safe_name(text: str) -> str:
 def main() -> None:
     utf8_console()
     args = parse_args()
+    check_plan_lock()
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = args.run_stamp or time.strftime("%Y%m%d-%H%M%S")
     if args.resume:
@@ -1575,10 +1637,6 @@ def main() -> None:
                     sender.close()
                 results.append(without_token(payload))
                 print("saved", save(payload))
-                # جروب من غير منشورات (خاص، فاضي): مفيش حاجة تتبعت
-                if not args.dry and payload["posts"] and not any(p.get("sheet_batches") for p in payload["posts"]):
-                    answer = sheet_post(payload)
-                    print("sheet:", answer[:400])
             # من غير ده، --trace في تشغيل ناجح بيرمي التتبّع ويسيب الـ HAR لوحده
             if recorder and args.trace:
                 recorder.dump("complete")

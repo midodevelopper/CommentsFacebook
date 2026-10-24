@@ -55,7 +55,7 @@ def test_defaults():
 @pytest.mark.unit
 def test_probes_are_well_formed():
     names = [p["name"] for p in bd.PROBES]
-    assert len(names) == len(set(names)) == 44
+    assert len(names) == len(set(names)) == 47
     for p in bd.PROBES:
         assert p["kind"] in ("css", "role", "text")
         assert p["tier"] in ("critical", "degraded", "context")
@@ -603,3 +603,31 @@ def test_har_omits_response_bodies_by_default(page, context, isolated_output_dir
     assert "text" not in entry["response"]["content"]
     assert (out / "network.har").stat().st_size < 50000
     rec.detach()
+
+
+@pytest.mark.unit
+def test_dump_never_raises_when_the_folder_cannot_be_created(monkeypatch, tmp_path):
+    """PageRecorder.dump() must keep working while everything else is broken, including the disk."""
+    import browser_debug
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(browser_debug, "DEBUG_DIR", blocker)
+
+    class P:
+        url = "about:blank"
+
+        def title(self):
+            return ""
+
+    rec = browser_debug.PageRecorder(P(), label="x", attach=False)
+    out = rec.dump("failed")
+    assert out.parent == blocker and rec.dumps == []
+
+
+@pytest.mark.unit
+def test_post_composer_probe_is_registered():
+    import browser_debug
+
+    probe = next(p for p in browser_debug.PROBES if p["name"] == "post.composer")
+    assert probe["selector"] == "[role='textbox'][contenteditable='true']" and probe["tier"] == "context"

@@ -231,6 +231,16 @@ PROBES: list[dict] = [
      "selector": "[role='textbox'][aria-label*='تعليقًا عامًا'], [role='textbox'][aria-label*='public comment' i]",
      "used_by": "post_one (مستبعد)", "expected": "صندوق «اكتب تعليقًا عامًا» — الرد مايتكتبش فيه أبدًا",
      "tier": "context", "page": "post", "zero_ok": "المنشور مقفول التعليقات أو الصندوق لسه مارسمش"},
+    {"name": "post.composer", "kind": "css", "selector": "[role='textbox'][contenteditable='true']",
+     "used_by": "fb_return_replies (الرد على منشور — مقفول افتراضيًا)",
+     "expected": "صندوق تعليق المنشور بالـ role مش بالنص (الليبل بيتغير: «اكتب تعليقًا عامًا» / «أرسل تعليقك الأول» / «اكتب إجابة»)",
+     "tier": "context", "page": "post", "zero_ok": "التعليقات مقفولة أو الصندوق لسه مارسمش"},
+    {"name": "comment.mention_link", "kind": "css", "selector": "div[dir='auto'] a[href*='/user/']",
+     "used_by": "visible_snapshot (mentions → دليل الرد على ردنا)", "expected": "منشن لحساب جوه نص التعليق",
+     "tier": "context", "page": "post", "zero_ok": "مفيش منشن في التعليقات الظاهرة"},
+    {"name": "reply.mention_link", "kind": "css", "selector": "div[dir='auto'] a",
+     "used_by": "find_own_reply (المنشن قدام ردنا)", "expected": "رابط جوه نص الرد (المنشن)",
+     "tier": "context", "page": "post", "zero_ok": "مفيش روابط جوه النصوص"},
     {"name": "reply.any_article", "kind": "css", "selector": "[role='article']",
      "used_by": "post_one (reply_present / expand_thread)", "expected": "كل article (منشور + تعليقات + ردود) — لدوّارة الردود",
      "tier": "degraded", "page": "post"},
@@ -682,7 +692,12 @@ class PageRecorder:
     def dump(self, reason: str = "dump", exc: BaseException | None = None) -> Path:
         """يحفظ كل حاجة في فولدر واحد ويرجّع مساره. مابيرفعش استثناء أبدًا."""
         out = DEBUG_DIR / f"{_stamp()}-{_safe(self.label)}-{_safe(reason)}"
-        out.mkdir(parents=True, exist_ok=True)
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            # الديسك أو درايف جوجل رفض: مانرفعش استثناء أبدًا (الصفحة بايظة أصلًا)، بنقول وبس
+            print(f"[debug] can't create {out}: {exc}", file=sys.stderr)
+            return out
 
         meta: dict[str, Any] = {
             "label": self.label,
@@ -825,7 +840,8 @@ class PageRecorder:
             except Exception as e:
                 meta["har_error"] = str(e)[:300]
 
-        write_logs()
+        with contextlib.suppress(Exception):
+            write_logs()
 
         self.dumps.append(out)
         print(f"[debug] saved {out}", file=sys.stderr)

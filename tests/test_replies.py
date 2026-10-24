@@ -1,4 +1,5 @@
-"""fb_return_replies.py: Sheets calls, main() loop, and post_one() against the simulator.
+"""fb_return_replies.py (API v2): config, run_one outcomes, journal replay, main() loop, and post_one()
+against the simulator.
 
 No real reply is ever published: post_one runs only inside the headless browser
 against tests/fake_facebook.py, and Sheets calls go to a loopback server.
@@ -21,26 +22,30 @@ G = "4678007325765117"
 P = "77"
 
 
-# ---------------------------------------------------------------- constants
+# ---------------------------------------------------------------- constants / config (API v2)
 
 @pytest.mark.unit
-def test_constants():
-    import fb_groups_to_sheet
-
-    assert replies.WEBAPP == fb_groups_to_sheet.WEBAPP
+def test_no_deployment_url_or_token_in_reply_source():
+    source = (ROOT / "fb_return_replies.py").read_text(encoding="utf-8")
+    assert "script.google.com/macros" not in source and "CommentSecrets" not in source and "AKfy" not in source
     assert replies.CDP == os.environ.get("FB_CDP", "http://127.0.0.1:9333")
 
 
-@pytest.mark.cli
-def test_token_reads_fb_sheet_token_env_like_the_scraper():
-    """Fixed D-05: the reply script used to hardcode TOKEN and ignore FB_SHEET_TOKEN."""
-    code = "import fb_return_replies as m; print(m.TOKEN)"
-    out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60,
-                         env={**os.environ, "FB_SHEET_TOKEN": "from-env"})
-    assert out.stdout.strip() == "from-env"
-    env = {k: v for k, v in os.environ.items() if k != "FB_SHEET_TOKEN"}
-    out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60, env=env)
-    assert out.stdout.strip() == "CommentSecrets"
+@pytest.mark.unit
+def test_load_config_prefers_environment(monkeypatch):
+    monkeypatch.setenv("FB_SHEET_WEBAPP", "https://example.test/exec")
+    monkeypatch.setenv("FB_SHEET_ADMIN_KEY", "admin-k")
+    monkeypatch.setenv("FB_SHEET_ID", "sheet-1")
+    assert replies.load_config() == ("https://example.test/exec", "admin-k", "sheet-1")
+
+
+@pytest.mark.unit
+def test_load_config_refuses_when_incomplete(monkeypatch, tmp_path):
+    for k in ("FB_SHEET_WEBAPP", "FB_SHEET_ADMIN_KEY", "FB_SHEET_ID"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(replies, "ROOT", tmp_path)
+    with pytest.raises(SystemExit):
+        replies.load_config()
 
 
 @pytest.mark.cli
@@ -48,75 +53,258 @@ def test_cli_help_lists_flags():
     out = subprocess.run([PYTHON, "fb_return_replies.py", "--help"], cwd=ROOT, capture_output=True,
                          text=True, encoding="utf-8", timeout=60, env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert out.returncode == 0
-    for flag in ("--cdp", "--debug", "--trace"):
+    for flag in ("--cdp", "--debug", "--trace", "--max-replies", "--dry-run", "--allow-post-replies"):
         assert flag in out.stdout
 
 
-# ---------------------------------------------------------------- sheet_get / sheet_post (real loopback HTTP)
+# ---------------------------------------------------------------- fake v2 API client
+
+class FakeClient:
+    """Records calls and answers like the v2 receiver. errors: {action: ApiError} raised once per entry."""
+
+    def __init__(self, eligible=None, blocked=None):
+        self.calls = []
+        self.eligible = eligible or []
+        self.blocked = blocked or []
+        self.errors: dict[str, list] = {}
+        self.fence = 0
+
+    def call(self, action, payload=None, target=None, request_id=None, budget_ms=240000):
+        self.calls.append((action, payload or {}, target))
+        queued = self.errors.get(action)
+        if queued:
+            raise queued.pop(0)
+        if action == "pending_replies":
+            return {"ok": True, "result": {"eligible": list(self.eligible), "blocked": list(self.blocked)}}
+        if action == "claim":
+            self.fence += 1
+            it = next(e for e in self.eligible if e["id"] == payload["id"])
+            return {"ok": True, "result": {"claim_id": f"claim-{payload['id']}-{self.fence}", "fence": self.fence,
+                                           "binding": {"reply_sha256": "x"}, "target": dict(it)}}
+        return {"ok": True, "result": {}}
+
+    def actions(self):
+        return [c[0] for c in self.calls]
+
+    def marks(self):
+        return [(c[1]["id"], c[1]["to"], c[1].get("expected_status")) for c in self.calls if c[0] == "mark_status"]
+
+
+def target(cid, reply="شكرا", kind="comment", author_id="100000000000005"):
+    return {"kind": kind, "id": cid, "post_id": P, "group_id": G, "parent_id": "",
+            "url": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={cid}", "author": "a",
+            "author_id": author_id, "reply": reply}
+
+
+def item(cid, reply="شكرا"):
+    """v1-shaped item still accepted by post_one (comment_id + permalink)."""
+    return {"comment_id": cid, "post_id": P, "group_id": G, "parent_id": "",
+            "permalink": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={cid}", "author": "a",
+            "reply": reply}
+
+
+ME = "100000000000777"
+
 
 @pytest.fixture
-def sheet(http_server, monkeypatch):
-    monkeypatch.setattr(replies, "WEBAPP", http_server.url + "/exec")
-    return http_server
+def journal(tmp_path):
+    return replies.Journal(tmp_path / "journal.jsonl")
+
+
+def fake_post_one(outcome, reply_id="7000000000001"):
+    def post_one(page, rec, gate=None):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome in ("posted", "unconfirmed", "gate-refused", "boom-after-submit"):
+            if gate is not None and not gate():
+                return "gate-refused"
+            rec["_submitted"] = True
+            if outcome == "boom-after-submit":
+                raise RuntimeError("after enter")
+        if outcome in ("posted", "already-posted"):
+            rec["_reply"] = {"id": reply_id, "time": "24 أكتوبر 2026 الساعة 11:00 ص"}
+        return outcome
+    return post_one
+
+
+# ---------------------------------------------------------------- run_one: every outcome
+
+@pytest.mark.unit
+def test_run_one_posted_marks_sent_with_the_reply_id_and_closes_the_journal(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one("posted"))
+    assert replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0}) == "posted"
+    assert client.actions() == ["claim", "prepare_submit", "mark_status"]
+    mark = client.calls[-1][1]
+    assert mark["to"] == "sent" and mark["expected_status"] == "sending" and mark["sent_reply_id"] == "7000000000001"
+    assert mark["sent_at"].startswith("2026-10-24T11:00:00")
+    events = [json.loads(l)["event"] for l in journal.path.read_text(encoding="utf-8").splitlines()]
+    assert events == ["intent", "authorized", "submitted", "confirmed", "marked"]
+    assert journal.open_attempts() == []
 
 
 @pytest.mark.unit
-def test_sheet_get_sends_action_and_token_as_query(sheet):
-    sheet.respond(body={"ok": True, "count": 0, "replies": []})
-    assert replies.sheet_get("pending_replies") == {"ok": True, "count": 0, "replies": []}
-    req = sheet.requests[-1]
-    assert req["method"] == "GET" and req["path"] == "/exec"
-    assert req["query"] == {"action": "pending_replies", "token": replies.TOKEN}
+def test_run_one_already_posted_marks_sent_without_submitting(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one("already-posted"))
+    assert replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0}) == "already-posted"
+    assert "prepare_submit" not in client.actions()
+    assert client.marks() == [("1", "sent", "sending")]
 
 
 @pytest.mark.unit
-def test_sheet_post_sends_json(sheet):
-    sheet.respond(body={"ok": True, "marked": 1})
-    assert replies.sheet_post({"token": "t", "action": "mark_replied", "comment_ids": ["9"]}) == {"ok": True, "marked": 1}
-    req = sheet.requests[-1]
-    assert req["method"] == "POST" and req["headers"]["Content-Type"] == "application/json"
-    assert json.loads(req["body"]) == {"token": "t", "action": "mark_replied", "comment_ids": ["9"]}
+def test_run_one_unconfirmed_marks_uncertain_never_failed(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one("unconfirmed"))
+    assert replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0}) == "unconfirmed"
+    assert client.marks() == [("1", "uncertain", "sending")]
 
 
 @pytest.mark.unit
-def test_sheet_post_escapes_non_ascii(sheet):
-    """Characterization: unlike the scraper, json.dumps here uses ensure_ascii (still valid JSON)."""
-    replies.sheet_post({"x": "عربي"})
-    assert b"\\u0639" in sheet.requests[-1]["body"]
+def test_run_one_refused_prepare_releases_without_pressing_enter(monkeypatch, journal):
+    from tools.plan_exec.client import ApiError
+
+    client = FakeClient([target("1")])
+    client.errors["prepare_submit"] = [ApiError("E_DNC", "author on do-not-contact")]
+    monkeypatch.setattr(replies, "post_one", fake_post_one("posted"))
+    assert replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0}) == "gate-refused"
+    assert client.actions() == ["claim", "prepare_submit", "release_claim"]
+    assert "E_DNC" in client.calls[-1][1]["note"]
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("fn", ["get", "post"])
-def test_sheet_calls_raise_on_invalid_json(sheet, fn):
-    sheet.respond(body="<html>error</html>", content_type="text/html")
-    with pytest.raises(json.JSONDecodeError):
-        replies.sheet_get("pending_replies") if fn == "get" else replies.sheet_post({})
+@pytest.mark.parametrize("status", ["no-comment", "no-reply-button", "no-reply-box", "typing-failed", "not-a-member", "missing-permalink"])
+def test_run_one_failures_before_enter_mark_failed(monkeypatch, journal, status):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one(status))
+    assert replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0}) == status
+    assert client.marks() == [("1", "failed", "sending")]
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("fn", ["get", "post"])
-def test_sheet_calls_propagate_http_errors(sheet, fn):
-    sheet.respond(status=500, body="x")
-    with pytest.raises(urllib.error.HTTPError):
-        replies.sheet_get("pending_replies") if fn == "get" else replies.sheet_post({})
+def test_run_one_exception_before_enter_releases_the_claim(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one(TimeoutError("textbox")))
+    with pytest.raises(TimeoutError):
+        replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0})
+    assert client.actions() == ["claim", "release_claim"]
 
 
 @pytest.mark.unit
-def test_sheet_calls_use_60s_timeout(monkeypatch):
-    seen = []
-
-    def fake_urlopen(req, timeout):
-        seen.append(timeout)
-        raise TimeoutError()
-
-    monkeypatch.setattr(replies.urllib.request, "urlopen", fake_urlopen)
-    for call in (lambda: replies.sheet_get("x"), lambda: replies.sheet_post({})):
-        with pytest.raises(TimeoutError):
-            call()
-    assert seen == [60, 60]
+def test_run_one_exception_after_enter_marks_uncertain(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one("boom-after-submit"))
+    with pytest.raises(RuntimeError):
+        replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0})
+    assert client.marks() == [("1", "uncertain", "sending")]
 
 
-# ---------------------------------------------------------------- main() loop (post_one and browser replaced)
+@pytest.mark.unit
+def test_run_one_keyboard_interrupt_is_not_swallowed(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0})
+    assert client.actions() == ["claim", "release_claim"]
+
+
+@pytest.mark.unit
+def test_run_one_renews_the_lease_when_the_claim_is_old(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    monkeypatch.setattr(replies, "post_one", fake_post_one("posted"))
+    monkeypatch.setattr(replies, "RENEW_AFTER_S", -1)
+    replies.run_one(None, client, "S", target("1"), ME, journal, {"count": 0})
+    assert client.actions() == ["claim", "renew", "prepare_submit", "mark_status"]
+
+
+@pytest.mark.unit
+def test_run_one_counts_create_comment_requests_after_authorization(monkeypatch, journal):
+    client = FakeClient([target("1")])
+    counter = {"count": 3}
+
+    def post_one(page, rec, gate=None):
+        assert gate()
+        counter["count"] += 1          # what the page request listener does for the create mutation
+        rec["_submitted"] = True
+        rec["_reply"] = {"id": "7000000000001", "time": ""}
+        return "posted"
+    monkeypatch.setattr(replies, "post_one", post_one)
+    replies.run_one(None, client, "S", target("1"), ME, journal, counter)
+    marked = [json.loads(l) for l in journal.path.read_text(encoding="utf-8").splitlines()][-1]
+    assert marked["mutations"] == 1
+
+
+# ---------------------------------------------------------------- journal replay: four separate paths
+
+def open_attempt(journal, last, **extra):
+    base = {"kind": "comment", "id": "1", "claim_id": "c1", "fence": 1, "url": target("1")["url"], "reply": "شكرا",
+            "account_id": ME}
+    journal.write("c1", "intent", **base)
+    order = ["authorized", "submitted", "confirmed"]
+    for event in order[:order.index(last) + 1] if last in order else []:
+        journal.write("c1", event, **(extra if event == last else {}))
+
+
+@pytest.mark.unit
+def test_replay_intent_only_releases_the_claim(journal):
+    open_attempt(journal, "intent")
+    client = FakeClient()
+    assert replies.replay(None, client, "S", journal, ME) == [("1", "released")]
+    assert client.actions() == ["release_claim"]
+    assert journal.open_attempts() == []
+
+
+@pytest.mark.unit
+def test_replay_confirmed_marks_sent_with_the_journal_reply(journal):
+    open_attempt(journal, "confirmed", reply={"id": "7000000000001", "time": ""})
+    client = FakeClient()
+    assert replies.replay(None, client, "S", journal, ME) == [("1", "sent")]
+    assert client.calls[0][1]["sent_reply_id"] == "7000000000001"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("last", ["authorized", "submitted"])
+def test_replay_submitted_reconciles_and_marks_sent_when_found(monkeypatch, journal, last):
+    open_attempt(journal, last)
+    monkeypatch.setattr(replies, "open_target", lambda page, rec: "")
+    monkeypatch.setattr(replies, "expand_thread", lambda page, cid: 0)
+    monkeypatch.setattr(replies, "find_own_reply", lambda page, cid, reply, me, exclude=None: {"id": "7000000000002", "time": ""})
+    client = FakeClient()
+    assert replies.replay(None, client, "S", journal, ME) == [("1", "sent")]
+    assert client.calls[0][1]["to"] == "sent"
+
+
+@pytest.mark.unit
+def test_replay_submitted_not_found_becomes_uncertain_never_pending_or_failed(monkeypatch, journal):
+    open_attempt(journal, "submitted")
+    monkeypatch.setattr(replies, "open_target", lambda page, rec: "")
+    monkeypatch.setattr(replies, "expand_thread", lambda page, cid: 0)
+    monkeypatch.setattr(replies, "find_own_reply", lambda *a, **k: None)
+    client = FakeClient()
+    assert replies.replay(None, client, "S", journal, ME) == [("1", "uncertain")]
+    assert [c[0] for c in client.calls] == ["mark_status"]
+
+
+@pytest.mark.unit
+def test_replay_marked_attempts_are_left_alone(journal):
+    open_attempt(journal, "confirmed", reply={"id": "7", "time": ""})
+    journal.write("c1", "marked", outcome="posted")
+    client = FakeClient()
+    assert replies.replay(None, client, "S", journal, ME) == [] and client.calls == []
+
+
+@pytest.mark.unit
+def test_replay_tries_uncertain_when_the_lease_already_expired(journal):
+    from tools.plan_exec.client import ApiError
+
+    open_attempt(journal, "confirmed", reply={"id": "7000000000001", "time": ""})
+    client = FakeClient()
+    client.errors["mark_status"] = [ApiError("E_CONFLICT", "status is uncertain, expected sending")]
+    assert replies.replay(None, client, "S", journal, ME) == [("1", "sent")]
+    assert [c[1]["expected_status"] for c in client.calls] == ["sending", "uncertain"]
+
+
+# ---------------------------------------------------------------- main()
 
 class FakeRecorder:
     instances: list["FakeRecorder"] = []
@@ -137,22 +325,30 @@ class FakeRecorder:
 
 
 @pytest.fixture
-def loop(monkeypatch):
+def loop(monkeypatch, tmp_path):
     import browser_debug
 
-    state = {"pending": {"ok": True, "count": 0, "replies": []}, "posted": [], "outcomes": {},
-             "pw_used": False, "page_closed": False}
+    state = {"client": FakeClient(), "order": [], "page_closed": False, "cookies": [{"name": "c_user", "value": ME}],
+             "run": [], "dry": [], "slept": []}
+
+    class Ctx:
+        def cookies(self, url=None):
+            return state["cookies"]
+
+        def new_page(self):
+            return Page()
 
     class Page:
+        context = Ctx()
+
         def on(self, event, fn):
-            state.setdefault("handlers", []).append(event)
+            state["order"].append(("on", event, fn))
 
         def close(self):
             state["page_closed"] = True
 
     class PW:
         def __enter__(self):
-            state["pw_used"] = True
             return self
 
         def __exit__(self, *a):
@@ -163,24 +359,25 @@ def loop(monkeypatch):
             def connect_over_cdp(url):
                 state["cdp"] = url
 
-                class Ctx:
-                    def new_page(self):
-                        return Page()
-
                 class B:
                     contexts = [Ctx()]
                 return B()
 
-    def post_one(page, item):
-        outcome = state["outcomes"].get(item["comment_id"], "posted")
+    def run_one(page, client, sheet, item, me, journal, counter, recorder=None):
+        state["run"].append(item["id"])
+        outcome = state.get("outcomes", {}).get(item["id"], "posted")
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
     monkeypatch.setattr(replies, "sync_playwright", lambda: PW())
-    monkeypatch.setattr(replies, "sheet_get", lambda action: state.setdefault("get", action) and state["pending"])
-    monkeypatch.setattr(replies, "sheet_post", lambda payload: state["posted"].append(payload) or {"ok": True, "marked": 1})
-    monkeypatch.setattr(replies, "post_one", post_one)
+    monkeypatch.setattr(replies, "load_config", lambda: ("https://x/exec", "k", "S"))
+    monkeypatch.setattr(replies, "Client", lambda url, key: state["client"])
+    monkeypatch.setattr(replies, "JOURNAL", tmp_path / "journal.jsonl")
+    monkeypatch.setattr(replies, "run_one", run_one)
+    monkeypatch.setattr(replies, "dry_check", lambda page, item, me: state["dry"].append(item["id"]) or "dry-ok")
+    monkeypatch.setattr(replies.time, "sleep", state["slept"].append)
+    monkeypatch.setattr(replies.scraper, "check_plan_lock", lambda: None)
     FakeRecorder.instances = []
     monkeypatch.setattr(browser_debug, "PageRecorder", FakeRecorder)
     return state
@@ -191,139 +388,106 @@ def run(monkeypatch, *argv):
     return replies.main()
 
 
-def item(cid, reply="شكرا"):
-    return {"comment_id": cid, "post_id": P, "group_id": G, "parent_id": "",
-            "permalink": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={cid}", "author": "a",
-            "reply": reply}
-
-
 @pytest.mark.unit
-def test_main_requests_pending_replies(monkeypatch, loop):
-    run(monkeypatch)
-    assert loop["get"] == "pending_replies"
-
-
-@pytest.mark.unit
-def test_main_not_ok_exits_with_response(monkeypatch, loop):
-    loop["pending"] = {"ok": False, "error": "bad token"}
-    with pytest.raises(SystemExit) as exc:
-        run(monkeypatch)
-    assert exc.value.code == {"ok": False, "error": "bad token"}
-    assert not loop["pw_used"]
-
-
-@pytest.mark.unit
-def test_main_old_deployment_without_replies_key(monkeypatch, loop):
-    loop["pending"] = {"ok": True, "msg": "receiver is running"}
-    with pytest.raises(SystemExit) as exc:
-        run(monkeypatch)
-    assert "facebook_sheet_receiver.gs" in str(exc.value)
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("value", [[], None])
-def test_main_empty_pending_does_not_open_browser(monkeypatch, loop, capsys, value):
-    loop["pending"] = {"ok": True, "replies": value}
-    run(monkeypatch)
-    assert not loop["pw_used"]
-    assert capsys.readouterr().out.strip() == "pending 0"
-
-
-@pytest.mark.unit
-def test_main_marks_only_posted_items(monkeypatch, loop, capsys):
-    loop["pending"]["replies"] = [item("1"), item("2"), item("3"), item("4"), item("5")]
-    loop["outcomes"] = {"2": "no-comment", "3": "no-reply-button", "4": RuntimeError("boom"),
-                        "5": "missing-permalink"}
+def test_main_sweeps_then_lists_pending_for_our_account(monkeypatch, loop):
     run(monkeypatch, "--cdp", "http://127.0.0.1:1")
-    assert loop["posted"] == [{"token": replies.TOKEN, "action": "mark_replied", "comment_ids": ["1"]}]
-    assert loop["cdp"] == "http://127.0.0.1:1"
-    assert loop["page_closed"]
-    out = capsys.readouterr().out
-    assert "1 posted" in out and "2 no-comment" in out and "4 error boom" in out
+    assert loop["client"].actions()[:2] == ["sweep_restrictions", "pending_replies"]
+    assert loop["client"].calls[1][1] == {"account_id": ME} and loop["client"].calls[1][2] == "S"
+    assert loop["cdp"] == "http://127.0.0.1:1" and loop["page_closed"]
 
 
 @pytest.mark.unit
-def test_main_marks_each_success_separately(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1"), item("2")]
-    run(monkeypatch)
-    assert [p["comment_ids"] for p in loop["posted"]] == [["1"], ["2"]]
-
-
-@pytest.mark.unit
-def test_main_exception_on_one_item_does_not_stop_others(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1"), item("2")]
-    loop["outcomes"] = {"1": TimeoutError("textbox")}
-    run(monkeypatch)
-    assert [p["comment_ids"] for p in loop["posted"]] == [["2"]]
-
-
-@pytest.mark.unit
-def test_main_keyboard_interrupt_is_not_swallowed(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1"), item("2")]
-    loop["outcomes"] = {"1": KeyboardInterrupt()}
-    with pytest.raises(KeyboardInterrupt):
+def test_main_without_c_user_stops_with_account_exit(monkeypatch, loop):
+    loop["cookies"] = []
+    with pytest.raises(SystemExit) as exc:
         run(monkeypatch)
-    assert loop["posted"] == [] and loop["page_closed"]
+    assert exc.value.code == 3
+    assert loop["client"].calls == []
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("answer", [{"ok": False, "error": "bad token"}, {"ok": True, "marked": 0}])
-def test_main_warns_when_mark_replied_fails(monkeypatch, loop, capsys, answer):
-    """Fixed D-04: the mark_replied answer used to be printed and never checked. The loop still
-    continues (the reply is already on Facebook), but the gap is now reported."""
-    loop["pending"]["replies"] = [item("1"), item("2")]
-    monkeypatch.setattr(replies, "sheet_post", lambda payload: answer)
-    run(monkeypatch)
-    err = capsys.readouterr().err
-    assert "1 اتنشر بس ماتعلّمش posted" in err and "2 اتنشر بس ماتعلّمش posted" in err
-
-
-def test_main_no_warning_when_marked(monkeypatch, loop, capsys):
-    loop["pending"]["replies"] = [item("1")]
-    run(monkeypatch)
-    assert "ماتعلّمش" not in capsys.readouterr().err
+def test_main_respects_max_replies_and_paces_between_replies(monkeypatch, loop):
+    loop["client"].eligible = [target(str(i)) for i in range(1, 5)]
+    run(monkeypatch, "--max-replies", "3")
+    assert loop["run"] == ["1", "2", "3"]
+    assert len(loop["slept"]) == 2 and all(20 <= s <= 60 for s in loop["slept"])
 
 
 @pytest.mark.unit
-def test_main_mark_replied_http_failure_aborts_remaining(monkeypatch, loop):
-    """Characterization: an HTTP error while marking propagates and stops the loop
-    (the reply was already posted on Facebook but stays pending in the sheet)."""
-    loop["pending"]["replies"] = [item("1"), item("2")]
-    done = []
+def test_main_dry_run_never_claims(monkeypatch, loop):
+    loop["client"].eligible = [target("1"), target("2")]
+    run(monkeypatch, "--dry-run")
+    assert loop["dry"] == ["1", "2"] and loop["run"] == []
+    assert "claim" not in loop["client"].actions()
 
-    def failing(payload):
-        done.append(payload)
-        raise urllib.error.URLError("down")
-    monkeypatch.setattr(replies, "sheet_post", failing)
-    with pytest.raises(urllib.error.URLError):
+
+@pytest.mark.unit
+def test_main_skips_post_targets_unless_the_code_flag_is_given(monkeypatch, loop):
+    loop["client"].eligible = [target("1"), target("9", kind="post")]
+    run(monkeypatch)
+    assert loop["run"] == ["1"]
+    loop["run"].clear()
+    run(monkeypatch, "--allow-post-replies")
+    assert loop["run"] == ["1", "9"]
+
+
+@pytest.mark.unit
+def test_main_api_refusal_on_one_item_does_not_stop_others(monkeypatch, loop, capsys):
+    from tools.plan_exec.client import ApiError
+
+    loop["client"].eligible = [target("1"), target("2")]
+    loop["outcomes"] = {"1": ApiError("E_CONFLICT", "claimed")}
+    run(monkeypatch)
+    assert loop["run"] == ["1", "2"]
+    assert "1 skipped E_CONFLICT" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_main_account_blocked_mid_run_exits_3(monkeypatch, loop):
+    loop["client"].eligible = [target("1"), target("2")]
+    loop["outcomes"] = {"1": replies.scraper.AccountBlocked("redirected to https://www.facebook.com/checkpoint")}
+    with pytest.raises(SystemExit) as exc:
         run(monkeypatch)
-    assert len(done) == 1 and loop["page_closed"]
+    assert exc.value.code == 3 and loop["run"] == ["1"]
 
 
 @pytest.mark.unit
-def test_main_debug_dumps_failures_only(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1"), item("2"), item("3")]
-    loop["outcomes"] = {"2": "no-reply-button", "3": RuntimeError("x")}
+def test_main_warns_on_unconfirmed(monkeypatch, loop, capsys):
+    loop["client"].eligible = [target("1")]
+    loop["outcomes"] = {"1": "unconfirmed"}
+    run(monkeypatch)
+    assert "uncertain" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_main_debug_recorder_marks_items(monkeypatch, loop):
+    loop["client"].eligible = [target("1"), target("2")]
     run(monkeypatch, "--debug")
     (rec,) = FakeRecorder.instances
-    assert rec.label == "replies" and rec.trace is False and rec.har is False
-    assert rec.marks == ["comment 1", "comment 2", "comment 3"]
-    assert rec.dumps == ["no-reply-button-2", "error-3"]
-    assert rec.detached
-
-
-@pytest.mark.unit
-def test_main_debug_trace_enables_har_too(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1")]
-    run(monkeypatch, "--debug", "--trace")
-    assert FakeRecorder.instances[0].trace and FakeRecorder.instances[0].har
+    assert rec.label == "replies" and rec.marks == ["comment 1", "comment 2"] and rec.detached
 
 
 @pytest.mark.unit
 def test_main_without_debug_no_recorder(monkeypatch, loop):
-    loop["pending"]["replies"] = [item("1")]
+    loop["client"].eligible = [target("1")]
     run(monkeypatch, "--trace")
     assert FakeRecorder.instances == []
+
+
+@pytest.mark.unit
+def test_main_registers_dialog_handler_before_recorder(monkeypatch, loop):
+    import browser_debug
+
+    class Rec(FakeRecorder):
+        def __init__(self, page, **k):
+            loop["order"].append(("recorder",))
+            super().__init__(page, **k)
+
+    monkeypatch.setattr(browser_debug, "PageRecorder", Rec)
+    run(monkeypatch, "--debug")
+    assert loop["order"][0] == ("on", "dialog", replies.accept_leaving)
+    assert ("recorder",) in loop["order"]
+    assert loop["order"].index(("on", "dialog", replies.accept_leaving)) < loop["order"].index(("recorder",))
 
 
 # ---------------------------------------------------------------- post_one against the simulator
@@ -360,13 +524,17 @@ def test_post_one_navigates_to_item_permalink(page, fake_fb):
 
 
 @pytest.mark.browser
-def test_post_one_reply_to_a_reply(page, fake_fb):
+def test_post_one_reply_to_a_reply_is_not_confirmed_without_nesting_evidence(page, fake_fb, monkeypatch):
+    """D32: under a reply target, «same thread + mention» can't tell which comment we answered. Our new reply
+    counts only when the page nests it inside the target; the simulator renders it flat, so it stays
+    unconfirmed (and the v2 sheet refuses nested targets anyway)."""
+    monkeypatch.setattr(replies, "CONFIRM_MS", 1000)
     cs = comments(2)
     cs[0].replies = [Comment(id="880000000000001")]
     setup_post(fake_fb, cs=cs)
     it = item("880000000000001")
     it["permalink"] = f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id={cs[0].id}&reply_comment_id=880000000000001"
-    assert replies.post_one(page, it) == "posted"
+    assert replies.post_one(page, it) == "unconfirmed"
     assert sent(page)[0]["comment_id"] == "880000000000001"
 
 
@@ -528,7 +696,7 @@ def test_post_one_existing_reply_is_not_posted_twice(page, fake_fb):
     """A previous run sent the reply but did not mark it (unconfirmed / mark_replied failed): no repost.
     The thread's collapsed replies are opened to look for it."""
     cs = comments(2)
-    cs[0].replies = [Comment(id="880000000000001", author="أنا", author_id="100000000000777", text="أنا شكرا")]
+    cs[0].replies = [Comment(id="880000000000001", author="أنا", author_id="100000000000777", text=f"{cs[0].author} شكرا")]
     fake_fb.add_group(Group(G), [Post(P, comments=cs, sort_mode="newest", replies_hidden=True)])
     assert replies.post_one(page, item(cs[0].id, "شكرا")) == "already-posted"
     assert sent(page) == []
@@ -609,58 +777,6 @@ def test_accept_leaving_before_recorder_lets_the_next_reply_load(page, fake_fb, 
 
 
 @pytest.mark.unit
-def test_main_marks_already_posted_and_not_unconfirmed(monkeypatch, loop, capsys):
-    loop["pending"]["replies"] = [item("1"), item("2"), item("3")]
-    loop["outcomes"] = {"1": "already-posted", "2": "unconfirmed", "3": "typing-failed"}
-    run(monkeypatch, "--debug")
-    assert [p["comment_ids"] for p in loop["posted"]] == [["1"]]
-    assert "2 الرد اتبعت بس ماظهرش" in capsys.readouterr().err
-    assert FakeRecorder.instances[0].dumps == ["unconfirmed-2", "typing-failed-3"]
-
-
-@pytest.mark.unit
-def test_main_registers_dialog_handler_before_recorder(monkeypatch, loop):
-    import browser_debug
-
-    order = []
-
-    class Page:
-        def on(self, event, fn):
-            order.append(("on", event, fn))
-
-        def close(self):
-            pass
-
-    class Ctx:
-        def new_page(self):
-            return Page()
-
-    class B:
-        contexts = [Ctx()]
-
-    class PW:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        class chromium:
-            connect_over_cdp = staticmethod(lambda url: B())
-
-    class Rec(FakeRecorder):
-        def __init__(self, page, **k):
-            order.append(("recorder",))
-            super().__init__(page, **k)
-
-    monkeypatch.setattr(replies, "sync_playwright", lambda: PW())
-    monkeypatch.setattr(browser_debug, "PageRecorder", Rec)
-    loop["pending"]["replies"] = [item("1")]
-    run(monkeypatch, "--debug")
-    assert order[0] == ("on", "dialog", replies.accept_leaving) and order[1] == ("recorder",)
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("kind,expected", [("beforeunload", "accept"), ("alert", "dismiss"), ("confirm", "dismiss")])
 def test_accept_leaving_accepts_only_beforeunload(kind, expected):
     calls = []
@@ -721,3 +837,56 @@ def test_post_one_still_no_comment_when_the_target_is_really_gone(page, fake_fb)
     setup_post(fake_fb, page_size=1)
     assert replies.post_one(page, item("123456789")) == "no-comment"
     assert sent(page) == []
+
+
+# ---------------------------------------------------------------- v2 strict matching and journal location
+
+@pytest.mark.unit
+def test_journal_default_path_follows_the_module_setting(monkeypatch, tmp_path):
+    """A test once wrote into the real dumps/replies/journal.jsonl because the default was bound at import."""
+    monkeypatch.setattr(replies, "JOURNAL", tmp_path / "j.jsonl")
+    assert replies.Journal().path == tmp_path / "j.jsonl"
+
+
+@pytest.mark.browser
+def test_post_one_longer_reply_containing_our_text_is_not_ours(page, fake_fb):
+    """Substring matching is gone: our account's longer reply that merely contains the text is not «already posted»."""
+    cs = comments(2)
+    cs[0].replies = [Comment(id="880000000000001", author="أنا", author_id="100000000000777",
+                             text=f"{cs[0].author} شكرا جزيلا على كل شيء")]
+    fake_fb.add_group(Group(G), [Post(P, comments=cs, sort_mode="newest", replies_hidden=False)])
+    assert replies.post_one(page, item(cs[0].id, "شكرا")) == "posted"
+    assert len(sent(page)) == 1
+
+
+@pytest.mark.browser
+def test_post_one_same_text_under_another_target_does_not_count(page, fake_fb):
+    """Our identical reply under a different comment of the same post is not a reply to this target."""
+    cs = comments(2)
+    cs[1].replies = [Comment(id="880000000000002", author="أنا", author_id="100000000000777", text=f"{cs[1].author} شكرا")]
+    fake_fb.add_group(Group(G), [Post(P, comments=cs, sort_mode="newest", replies_hidden=False)])
+    assert replies.post_one(page, item(cs[0].id, "شكرا")) == "posted"
+    assert sent(page)[0]["comment_id"] == cs[0].id
+
+
+@pytest.mark.browser
+def test_find_own_reply_returns_the_new_reply_id_and_ignores_preexisting_ones(page, fake_fb):
+    post = setup_post(fake_fb)
+    target_id = post.comments[0].id
+    before = None
+
+    def gate():
+        nonlocal before
+        before = replies.reply_ids(page, target_id)
+        return True
+    it = item(target_id, "أهلا")
+    assert replies.post_one(page, it, gate) == "posted"
+    assert it["_reply"]["id"] not in before and it["_submitted"] is True
+
+
+@pytest.mark.browser
+def test_post_one_gate_refusal_presses_no_enter(page, fake_fb):
+    post = setup_post(fake_fb)
+    it = item(post.comments[0].id, "أهلا")
+    assert replies.post_one(page, it, lambda: False) == "gate-refused"
+    assert sent(page) == [] and "_submitted" not in it

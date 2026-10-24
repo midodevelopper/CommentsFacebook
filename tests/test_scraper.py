@@ -25,8 +25,6 @@ P = "1234567890123456"
 # ---------------------------------------------------------------- constants / contracts
 
 def test_constants():
-    assert scraper.WEBAPP.startswith("https://script.google.com/macros/s/")
-    assert scraper.WEBAPP.endswith("/exec")
     assert scraper.CDP == os.environ.get("FB_CDP", "http://127.0.0.1:9333")
     assert str(scraper.DUMP_DIR).endswith("dumps")
 
@@ -34,24 +32,30 @@ def test_constants():
 def test_dump_dir_is_relative_to_project_folder():
     """DUMP_DIR follows the project folder, so the project keeps working after a move."""
     source = (ROOT / "fb_groups_to_sheet.py").read_text(encoding="utf-8")
-    assert 'DUMP_DIR = Path(__file__).resolve().parent / "dumps"' in source
+    assert 'ROOT = Path(__file__).resolve().parent' in source and 'DUMP_DIR = ROOT / "dumps"' in source
+
+
+def test_no_deployment_url_or_token_in_source():
+    """v2: the web-app URL and the write key come from the environment or .secrets/, never from the public repo."""
+    source = (ROOT / "fb_groups_to_sheet.py").read_text(encoding="utf-8")
+    assert "script.google.com/macros" not in source and "CommentSecrets" not in source and "AKfy" not in source
 
 
 @pytest.mark.cli
-def test_token_and_cdp_read_from_environment_at_import():
-    code = "import fb_groups_to_sheet as m, json; print(json.dumps([m.TOKEN, m.CDP]))"
-    env = {**os.environ, "FB_SHEET_TOKEN": "tok-from-env", "FB_CDP": "http://127.0.0.1:9555"}
+def test_webapp_ingest_key_and_cdp_read_from_environment_at_import():
+    code = "import fb_groups_to_sheet as m, json; print(json.dumps([m.WEBAPP, m.INGEST_KEY, m.CDP]))"
+    env = {**os.environ, "FB_SHEET_WEBAPP": "https://example.test/exec", "FB_SHEET_INGEST_KEY": "k-env",
+           "FB_CDP": "http://127.0.0.1:9555"}
     out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout) == ["tok-from-env", "http://127.0.0.1:9555"]
+    assert json.loads(out.stdout) == ["https://example.test/exec", "k-env", "http://127.0.0.1:9555"]
 
 
-@pytest.mark.cli
-def test_token_default_when_env_missing():
-    code = "import fb_groups_to_sheet as m; print(m.TOKEN == 'CommentSecrets')"
-    env = {k: v for k, v in os.environ.items() if k != "FB_SHEET_TOKEN"}
-    out = subprocess.run([PYTHON, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
-    assert out.stdout.strip() == "True"
+def test_sheet_post_refuses_without_configuration(monkeypatch):
+    monkeypatch.setattr(scraper, "WEBAPP", "")
+    with pytest.raises(SystemExit) as exc:
+        scraper.sheet_post({"auth": {"key": "k"}})
+    assert "FB_SHEET_WEBAPP" in str(exc.value)
 
 
 # ---------------------------------------------------------------- group_key / regexes
@@ -171,6 +175,7 @@ def test_normalize_top_level_comment():
         "created_time_raw": "الأربعاء، 21 أكتوبر 2026 الساعة 3:38 م",
         "has_media": False, "aria_label": "تعليق بواسطة أحمد",
         "permalink": f"https://www.facebook.com/groups/{G}/posts/{P}/?comment_id=901",
+        "nest_parent_id": "", "mentions": [], "moderation": "",
     }
 
 
@@ -221,77 +226,95 @@ def test_normalize_long_unicode_text_is_kept_whole():
     assert scraper.normalize_comment({"link": link("1"), "text": text}, G, P)["text"] == text.strip()
 
 
-# ---------------------------------------------------------------- sheet_comment / sheet_post_payload
+# ---------------------------------------------------------------- sheet_comment / sheet_post_payload (API v2)
 
 SHEET_COMMENT_KEYS = ["comment_id", "parent_id", "reply_comment_id", "is_reply", "reply_target_id",
-                      "author", "author_id", "author_url", "text", "created_time", "permalink",
-                      "post content", "reply", "reply_status"]
+                      "author", "author_id", "author_url", "text", "created_time", "url",
+                      "nest_parent_id", "mentions", "moderation"]
 
 
 def test_sheet_comment_contract_keys_and_order():
     assert list(scraper.sheet_comment({}).keys()) == SHEET_COMMENT_KEYS
 
 
+def test_sheet_comment_never_carries_reply_fields():
+    """v2: the scraper owns no reply state; even a stale dump with reply fields sends none."""
+    out = scraper.sheet_comment({"reply": "شكرا", "reply_status": "posted"})
+    assert "reply" not in out and "reply_status" not in out
+
+
 def test_sheet_comment_empty_input():
     out = scraper.sheet_comment({})
-    assert out["is_reply"] is False
-    assert all(v == "" for k, v in out.items() if k != "is_reply")
+    assert out["is_reply"] is False and out["mentions"] == []
+    assert all(v == "" for k, v in out.items() if k not in ("is_reply", "mentions"))
 
 
 def test_sheet_comment_from_normalized_reply():
-    normalized = scraper.normalize_comment({"link": link("901", "902"), "author": "x", "text": "t"}, G, P)
-    out = scraper.sheet_comment(normalized, "محتوى")
+    normalized = scraper.normalize_comment({"link": link("901", "902"), "author": "x", "text": "t",
+                                            "created_time": "21 أكتوبر 2026 الساعة 3:38 م"}, G, P)
+    out = scraper.sheet_comment(normalized)
     assert out["comment_id"] == "902" and out["parent_id"] == "901" and out["reply_comment_id"] == "902"
     assert out["is_reply"] is True and out["reply_target_id"] == "902"
-    assert out["post content"] == "محتوى"
+    assert out["url"] == normalized["permalink"]
+    assert re.fullmatch(r"2026-10-21T15:38:00[+-]\d{2}:\d{2}", out["created_time"])
     assert "aria_label" not in out and "group_id" not in out and "post_id" not in out
 
 
 def test_sheet_comment_fallbacks():
     assert scraper.sheet_comment({"parent_comment_id": "5"})["parent_id"] == "5"
     assert scraper.sheet_comment({"comment_id": "9"})["reply_target_id"] == "9"
-    assert scraper.sheet_comment({"post_content": "a"})["post content"] == "a"
-    assert scraper.sheet_comment({"post content": "b", "post_content": "a"})["post content"] == "b"
-    assert scraper.sheet_comment({"post content": "b"}, "arg")["post content"] == "arg"
     assert scraper.sheet_comment({"is_reply": "yes"})["is_reply"] is True
+    assert scraper.sheet_comment({"mentions": ["123", "", "x"]})["mentions"] == ["123"]
+    assert scraper.sheet_comment({"created_time": "٥ د"})["created_time"] == ""
 
 
-def test_sheet_comment_carries_existing_reply_fields():
-    out = scraper.sheet_comment({"reply": "شكرا", "reply_status": "posted"})
-    assert (out["reply"], out["reply_status"]) == ("شكرا", "posted")
+def test_iso_time_keeps_local_wall_clock_with_offset():
+    import datetime as _dt
+
+    iso = scraper.iso_time("2026-10-22 13:05")
+    parsed = _dt.datetime.fromisoformat(iso)
+    assert parsed.utcoffset() is not None
+    assert parsed.replace(tzinfo=None) == _dt.datetime(2026, 10, 22, 13, 5)
+    assert scraper.iso_time("garbage") == "" and scraper.iso_time("") == ""
 
 
 def test_sheet_post_payload_contract():
-    post = {"post_id": P, "author": "A", "author_id": "1", "post_content": "content", "text": "t",
-            "created_time": "ct", "url": "u", "permalink": "p", "comment_sort": "الأحدث"}
+    post = {"post_id": P, "author": "A", "author_id": "1", "post_content": "content", "media_url": "https://m",
+            "text": "t", "created_time": "2026-10-22 13:05", "url": "u", "permalink": "p", "comment_sort": "الأحدث"}
     comments = [scraper.normalize_comment({"link": link("1")}, G, P)]
-    payload = scraper.sheet_post_payload(G, post, comments)
-    assert list(payload.keys()) == ["token", "group_id", "posts"]
-    assert payload["token"] == scraper.TOKEN and payload["group_id"] == G
-    (p,) = payload["posts"]
-    assert list(p.keys()) == ["post_id", "author", "author_id", "text", "post content", "created_time",
-                              "url", "permalink", "comment_sort", "comments"]
-    assert p["text"] == "t"                    # the post's own words
-    assert p["post content"] == "content"      # media/link when present, else the text
-    assert p["comments"][0]["post content"] == "content"
+    payload = scraper.sheet_post_payload(G, post, comments, group_name="اسم", account_id="777")
+    assert list(payload.keys()) == ["api_version", "action", "auth", "payload"]
+    assert payload["api_version"] == 2 and payload["action"] == "ingest"
+    assert payload["auth"] == {"kind": "ingest", "key": scraper.INGEST_KEY}
+    body = payload["payload"]
+    assert body["group_id"] == G and body["account_id"] == "777"
+    (p,) = body["posts"]
+    assert list(p.keys()) == ["post_id", "group_name", "author", "author_id", "text", "media_url", "created_time",
+                              "url", "comment_sort", "comments"]
+    assert p["text"] == "t" and p["media_url"] == "https://m" and p["group_name"] == "اسم"
+    assert "T13:05:00" in p["created_time"]
     assert list(p["comments"][0].keys()) == SHEET_COMMENT_KEYS
 
 
-def test_sheet_post_payload_defaults():
-    p = scraper.sheet_post_payload(G, {"post_id": P, "text": "t", "permalink": "pl"}, [])["posts"][0]
+def test_sheet_post_payload_defaults_and_no_caption_copy_in_media_url():
+    p = scraper.sheet_post_payload(G, {"post_id": P, "text": "t", "post_content": "t", "permalink": "pl"}, [])["payload"]["posts"][0]
     assert p["comment_sort"] == "الأحدث"
-    assert p["text"] == p["post content"] == "t"
-    assert p["url"] == "pl" and p["permalink"] == "pl"
+    assert p["media_url"] == ""
+    assert p["url"] == "pl"
     assert p["author"] == p["author_id"] == p["created_time"] == ""
     assert p["comments"] == []
 
 
 def test_sheet_post_payload_does_not_send_author_url_or_content_kind():
-    p = scraper.sheet_post_payload(G, {"post_id": P, "author_url": "x", "content_kind": "video"}, [])["posts"][0]
+    p = scraper.sheet_post_payload(G, {"post_id": P, "author_url": "x", "content_kind": "video"}, [])["payload"]["posts"][0]
     assert "author_url" not in p and "content_kind" not in p
 
 
 # ---------------------------------------------------------------- sheet_post transport (real loopback HTTP)
+
+def env_body(**extra):
+    return dict({"api_version": 2, "action": "ingest", "auth": {"kind": "ingest", "key": "k"}, "payload": {}}, **extra)
+
 
 @pytest.fixture
 def sheet(http_server, monkeypatch):
@@ -299,30 +322,39 @@ def sheet(http_server, monkeypatch):
     return http_server
 
 
-def test_sheet_post_sends_utf8_json_post(sheet):
+def test_sheet_post_sends_utf8_json_post_with_a_request_id(sheet):
     sheet.respond(body='{"ok":true,"posts_new":1}')
-    answer = scraper.sheet_post({"token": "t", "text": "عربي 🌙"})
+    answer = scraper.sheet_post(env_body(text="عربي 🌙"))
     assert answer == '{"ok":true,"posts_new":1}'
     req = sheet.requests[-1]
     assert req["method"] == "POST" and req["path"] == "/exec"
     assert req["headers"]["Content-Type"] == "application/json"
     assert "عربي 🌙".encode("utf-8") in req["body"]          # ensure_ascii=False
-    assert json.loads(req["body"]) == {"token": "t", "text": "عربي 🌙"}
+    body = json.loads(req["body"])
+    assert body["text"] == "عربي 🌙" and re.fullmatch(r"[0-9a-f-]{36}", body["request_id"])
 
 
 def test_sheet_post_stops_when_apps_script_says_not_ok(sheet):
-    """Fixed D-02: {"ok": false} (bad token, script error) used to be printed and ignored."""
-    sheet.respond(body='{"ok":false,"error":"bad token"}')
+    """Fixed D-02: {"ok": false} used to be printed and ignored."""
+    sheet.respond(body='{"ok":false,"code":"E_AUTH","error":"bad key"}')
     with pytest.raises(SystemExit) as exc:
-        scraper.sheet_post({"token": "wrong"})
-    assert "bad token" in str(exc.value)
+        scraper.sheet_post(env_body())
+    assert "E_AUTH" in str(exc.value)
+
+
+@pytest.mark.parametrize("code", ["E_MAINTENANCE", "E_SCHEMA", "E_VERSION", "E_VALIDATION"])
+def test_sheet_post_gate_codes_stop_without_retry(sheet, monkeypatch, code):
+    monkeypatch.setattr(scraper.time, "sleep", lambda s: None)
+    sheet.respond(body=json.dumps({"ok": False, "code": code, "error": "x"}))
+    with pytest.raises(SystemExit):
+        scraper.sheet_post(env_body())
+    assert len(sheet.requests) == 1
 
 
 def test_sheet_post_stops_on_non_json_answer(sheet):
-    """An HTML page from Apps Script (uncaught error, busy lock) is a failure, not a success."""
     sheet.respond(body="<html>Google error page</html>", content_type="text/html")
     with pytest.raises(SystemExit) as exc:
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
     assert "Google error page" in str(exc.value)
 
 
@@ -330,7 +362,7 @@ def test_sheet_post_stops_on_non_json_answer(sheet):
 def test_sheet_post_stops_without_explicit_ok_true(sheet, body):
     sheet.respond(body=body)
     with pytest.raises(SystemExit):
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
 
 
 @pytest.fixture
@@ -344,7 +376,7 @@ def test_sheet_post_http_5xx_retried_then_systemexit(sheet, no_sleep):
     """Fixed D-30: one transient Apps Script HTTP 500 used to abort the whole run (seen live)."""
     sheet.respond(status=500, body="x" * 2000)
     with pytest.raises(SystemExit) as exc:
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
     msg = str(exc.value)
     assert "HTTP 500" in msg and "محاولة 3" in msg
     assert msg.count("x") == 300
@@ -352,42 +384,34 @@ def test_sheet_post_http_5xx_retried_then_systemexit(sheet, no_sleep):
     assert no_sleep == [5, 15]
 
 
-def test_sheet_post_5xx_then_success(sheet, no_sleep):
+def test_sheet_post_5xx_then_success_reuses_the_request_id(sheet, no_sleep):
     sheet.queue(status=500, body="<html>We're sorry, a server error occurred.</html>", content_type="text/html")
     sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
-    assert scraper.sheet_post({"token": "t"}) == '{"ok":true,"posts_new":1}'
+    assert scraper.sheet_post(env_body()) == '{"ok":true,"posts_new":1}'
     assert len(sheet.requests) == 2 and sheet.requests[0]["body"] == sheet.requests[1]["body"]
     assert no_sleep == [5]
 
 
 @pytest.mark.parametrize("status", [404, 429])
 def test_sheet_post_transient_404_and_429_are_retried(sheet, no_sleep, status):
-    """Seen in RUN6: Google answered 404 «يتعذر فتح الملف في الوقت الحالي» after 110 good requests; a ping
-    seconds later worked. It used to stop the group on the first attempt."""
+    """Seen in RUN6: Google answered 404 «يتعذر فتح الملف في الوقت الحالي» after 110 good requests."""
     sheet.queue(status=status, body="<html>عذرًا، يتعذر فتح الملف في الوقت الحالي.</html>", content_type="text/html")
     sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
-    assert scraper.sheet_post({"token": "t"}) == '{"ok":true,"posts_new":1}'
+    assert scraper.sheet_post(env_body()) == '{"ok":true,"posts_new":1}'
     assert len(sheet.requests) == 2 and no_sleep == [5]
 
 
 def test_sheet_post_4xx_not_retried(sheet, no_sleep):
     sheet.respond(status=403, body="forbidden")
     with pytest.raises(SystemExit) as exc:
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
     assert "HTTP 403" in str(exc.value) and len(sheet.requests) == 1 and no_sleep == []
 
 
-def test_sheet_post_bad_token_not_retried(sheet, no_sleep):
-    sheet.respond(body='{"ok":false,"error":"bad token"}')
-    with pytest.raises(SystemExit):
-        scraper.sheet_post({})
-    assert len(sheet.requests) == 1 and no_sleep == []
-
-
 def test_sheet_post_busy_lock_retried(sheet, no_sleep):
-    sheet.queue(body='{"ok":false,"error":"Exception: Lock timeout: another process was holding the lock"}')
+    sheet.queue(body='{"ok":false,"code":"E_LOCK_BUSY","error":"script lock busy"}')
     sheet.queue(body='{"ok":true}')
-    assert scraper.sheet_post({}) == '{"ok":true}'
+    assert scraper.sheet_post(env_body()) == '{"ok":true}'
     assert no_sleep == [5]
 
 
@@ -402,7 +426,7 @@ def test_sheet_post_network_error_retried_then_propagates(monkeypatch, no_sleep)
 
     monkeypatch.setattr(scraper, "WEBAPP", f"http://127.0.0.1:{free_port()}/exec")
     with pytest.raises(urllib.error.URLError):
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
     assert no_sleep == [5, 15]
 
 
@@ -413,9 +437,10 @@ def test_sheet_post_timeout_is_90_seconds_and_retried(monkeypatch, no_sleep):
         seen.append(timeout)
         raise TimeoutError("timed out")
 
+    monkeypatch.setattr(scraper, "WEBAPP", "http://127.0.0.1:1/exec")
     monkeypatch.setattr(scraper.urllib.request, "urlopen", fake_urlopen)
     with pytest.raises(TimeoutError):
-        scraper.sheet_post({})
+        scraper.sheet_post(env_body())
     assert seen == [90, 90, 90]
 
 
@@ -596,11 +621,10 @@ def test_archive_group_return_contract(flow):
     calls, data = flow
     data.update({"11": 1})
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 2, 5, 1, 10)
-    assert list(out.keys()) == ["token", "group_id", "group_url", "group_name", "sort_posts",
+    assert list(out.keys()) == ["group_id", "group_url", "group_name", "sort_posts",
                                 "feed_sort_label", "sort_comments", "limits", "posts_found",
                                 "posts_shortfall", "posts", "posts_unavailable",   # + D-33: skipped deleted posts
                                 "posts_sort_skipped"]                               # + no sort control, 2+ comments
-    assert out["token"] == scraper.TOKEN
     assert out["group_url"] == f"https://www.facebook.com/groups/{G}"
     assert out["sort_posts"] == "CHRONOLOGICAL" and out["sort_comments"] == "الأحدث"
     assert out["feed_sort_label"] == "label"
@@ -630,11 +654,11 @@ def test_archive_group_sends_comments_in_batches(flow, n_comments, batch_size, e
     data.update({"11": n_comments})
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 1000,
                                 dry=False, batch_size=batch_size)
-    assert [len(p["posts"][0]["comments"]) for p in calls["sheet"]] == expected_sizes
-    assert all(p["token"] == scraper.TOKEN and p["group_id"] == G for p in calls["sheet"])
-    assert all(p["posts"][0]["post_id"] == "11" for p in calls["sheet"])
+    assert [len(p["payload"]["posts"][0]["comments"]) for p in calls["sheet"]] == expected_sizes
+    assert all(p["auth"]["kind"] == "ingest" and p["payload"]["group_id"] == G for p in calls["sheet"])
+    assert all(p["payload"]["posts"][0]["post_id"] == "11" for p in calls["sheet"])
     assert out["posts"][0]["sheet_batches"] == len(expected_sizes)
-    sent_ids = [c["comment_id"] for p in calls["sheet"] for c in p["posts"][0]["comments"]]
+    sent_ids = [c["comment_id"] for p in calls["sheet"] for c in p["payload"]["posts"][0]["comments"]]
     assert sent_ids == [str(1000 + i) for i in range(n_comments)]      # no duplicates, order kept
 
 
@@ -728,7 +752,7 @@ def run_main(monkeypatch, *argv):
 def fake_archive(posts_by_group):
     def archive(page, url, min_posts, max_posts, min_c, max_c, dry=True, batch_size=80, progress=None, sender=None):
         gid = scraper.group_key(url)
-        return {"token": scraper.TOKEN, "group_id": gid, "posts": posts_by_group.get(gid, [])}
+        return {"group_id": gid, "posts": posts_by_group.get(gid, [])}
     return archive
 
 
@@ -749,14 +773,8 @@ def test_main_dump_files_do_not_contain_the_sheet_token(monkeypatch, main_env):
     monkeypatch.setattr(scraper, "archive_group", fake_archive({}))
     run_main(monkeypatch, *BASE, "--dry")
     for f in main_env["dumps"].iterdir():
-        assert scraper.TOKEN not in f.read_text(encoding="utf-8"), f.name
+        assert (scraper.INGEST_KEY or "no-key-configured") not in f.read_text(encoding="utf-8"), f.name
     assert json.loads((main_env["dumps"] / "1-20261021-120000.json").read_text(encoding="utf-8"))["group_id"] == "1"
-
-
-def test_main_still_sends_token_to_sheet(monkeypatch, main_env):
-    monkeypatch.setattr(scraper, "archive_group", fake_archive({"1": [{"post_id": "9", "sheet_batches": 0}]}))
-    run_main(monkeypatch, *BASE)
-    assert main_env["sent"][0]["token"] == scraper.TOKEN
 
 
 def test_main_dump_keeps_unicode_unescaped(monkeypatch, main_env):
@@ -773,14 +791,9 @@ def test_main_sends_nothing_for_a_group_without_posts(monkeypatch, main_env):
     assert main_env["sent"] == []
 
 
-def test_main_fallback_send_when_posts_exist_but_none_were_batched(monkeypatch, main_env):
+def test_main_never_sends_the_group_result_itself(monkeypatch, main_env):
+    """v2: posts go out only through archive_group's ingest payloads; the old whole-group fallback is gone."""
     monkeypatch.setattr(scraper, "archive_group", fake_archive({"1": [{"post_id": "9", "sheet_batches": 0}]}))
-    run_main(monkeypatch, *BASE)
-    assert len(main_env["sent"]) == 1 and main_env["sent"][0]["posts"][0]["post_id"] == "9"
-
-
-def test_main_no_fallback_send_when_posts_were_batched(monkeypatch, main_env):
-    monkeypatch.setattr(scraper, "archive_group", fake_archive({"1": [{"post_id": "9", "sheet_batches": 1}]}))
     run_main(monkeypatch, *BASE)
     assert main_env["sent"] == []
 
@@ -846,7 +859,7 @@ def test_main_one_failing_group_stops_the_run_but_summary_is_kept(monkeypatch, m
         seen.append(gid)
         if gid == "2":
             raise SystemExit("sort failed")
-        return {"token": scraper.TOKEN, "group_id": gid, "posts": []}
+        return {"group_id": gid, "posts": []}
     monkeypatch.setattr(scraper, "archive_group", archive)
     with pytest.raises(SystemExit):
         run_main(monkeypatch, *BASE, "--group", "https://www.facebook.com/groups/2",
@@ -948,7 +961,7 @@ def test_main_keeps_finished_posts_when_a_later_post_fails(monkeypatch, main_env
     """Fixed D-31 (seen live): a failure mid-group used to lose every post already scraped."""
     def archive(page, url, *a, progress=None, **k):
         gid = scraper.group_key(url)
-        progress({"token": scraper.TOKEN, "group_id": gid, "posts": [{"post_id": "9"}]})
+        progress({"group_id": gid, "posts": [{"post_id": "9"}]})
         raise SystemExit("الشيت رفض الإرسال HTTP 500")
     monkeypatch.setattr(scraper, "archive_group", archive)
     with pytest.raises(SystemExit):
@@ -983,7 +996,7 @@ def test_archive_group_skips_unavailable_posts(flow, monkeypatch):
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10, dry=False)
     assert [p["post_id"] for p in out["posts"]] == ["11", "13"]
     assert out["posts_unavailable"] == ["12"]
-    assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["11", "13"]
+    assert [p["payload"]["posts"][0]["post_id"] for p in calls["sheet"]] == ["11", "13"]
 
 
 # ---------------------------------------------------------------- speed: polling, background Sheet sender, workers
@@ -1049,7 +1062,7 @@ def test_sheet_sender_merges_queued_posts_within_the_batch_size():
     merged = sender._merged([sender_payload("1", 2), sender_payload("2", 3), sender_payload("3", 1),
                              sender_payload("4", 0, group="other")])
     sender.close()
-    assert [[p["post_id"] for p in m["posts"]] for m in merged] == [["1", "2"], ["3"], ["4"]]
+    assert [[p["post_id"] for p in m["payload"]["posts"]] for m in merged] == [["1", "2"], ["3"], ["4"]]
     assert all(scraper.SheetSender._comments(m) <= 5 for m in merged)
 
 
@@ -1058,8 +1071,8 @@ def test_sheet_sender_joins_chunks_of_the_same_post_into_one_entry():
     sender = scraper.SheetSender(batch_size=10)
     merged = sender._merged([sender_payload("1", 2), sender_payload("1", 3)])
     sender.close()
-    assert len(merged) == 1 and len(merged[0]["posts"]) == 1
-    assert len(merged[0]["posts"][0]["comments"]) == 5
+    assert len(merged) == 1 and len(merged[0]["payload"]["posts"]) == 1
+    assert len(merged[0]["payload"]["posts"][0]["comments"]) == 5
 
 
 def test_sheet_sender_does_not_mutate_the_callers_payload():
@@ -1067,7 +1080,7 @@ def test_sheet_sender_does_not_mutate_the_callers_payload():
     sender = scraper.SheetSender(batch_size=10)
     sender._merged([first, sender_payload("1", 3)])
     sender.close()
-    assert len(first["posts"][0]["comments"]) == 2
+    assert len(first["payload"]["posts"][0]["comments"]) == 2
 
 
 def test_sheet_sender_sends_everything_before_close_returns(monkeypatch):
@@ -1077,7 +1090,7 @@ def test_sheet_sender_sends_everything_before_close_returns(monkeypatch):
     for i in range(5):
         sender.put(sender_payload(str(i), 2))
     sender.close()
-    assert sorted(c["comment_id"] for p in sent for post in p["posts"] for c in post["comments"]) == \
+    assert sorted(c["comment_id"] for p in sent for post in p["payload"]["posts"] for c in post["comments"]) == \
         sorted(f"{i}{j}" for i in range(5) for j in range(2))
     assert all(scraper.SheetSender._comments(p) <= 3 for p in sent)
 
@@ -1112,7 +1125,7 @@ def test_archive_group_hands_sheet_payloads_to_the_sender(flow):
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10,
                                 dry=False, sender=sender)
     assert calls["sheet"] == []                                       # nothing sent on the scraping thread
-    assert [p["posts"][0]["post_id"] for p in sender.payloads] == ["11", "12"]
+    assert [p["payload"]["posts"][0]["post_id"] for p in sender.payloads] == ["11", "12"]
     assert [p["sheet_batches"] for p in out["posts"]] == [1, 1]
 
 
@@ -1129,7 +1142,7 @@ def test_archive_group_lists_sort_skipped_posts_without_sending_them(flow, monke
     out = scraper.archive_group(FakeTitlePage(), f"https://www.facebook.com/groups/{G}", 1, 5, 0, 10, dry=False)
     assert out["posts_sort_skipped"] == ["11"] and out["posts_unavailable"] == []
     assert [p["post_id"] for p in out["posts"]] == ["12"]
-    assert [p["posts"][0]["post_id"] for p in calls["sheet"]] == ["12"]
+    assert [p["payload"]["posts"][0]["post_id"] for p in calls["sheet"]] == ["12"]
 
 
 # ---------------------------------------------------------------- no sort control helpers (2026-10-22)

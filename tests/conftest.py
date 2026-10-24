@@ -265,10 +265,14 @@ def fake_playwright(context):
 # ---------------------------------------------------------------- Apps Script web app (Node)
 
 class FakeWebApp:
-    """The real facebook_sheet_receiver.gs served over loopback HTTP by Node."""
+    """The real v2 receiver (apps_script/src) served over loopback HTTP by Node, at schema v2 and empty."""
+
+    ADMIN_KEY = "test-admin-key"
+    INGEST_KEY = "test-ingest-key"
+    SHEET_ID = "prod-spreadsheet-id"
 
     def __init__(self):
-        script = TESTS / "apps_script" / "webapp_server.mjs"
+        script = TESTS / "apps_script" / "webapp_server_v2.mjs"
         self.proc = subprocess.Popen(
             ["node", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8",
