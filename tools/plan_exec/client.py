@@ -77,6 +77,7 @@ class Client:
         raise ApiError("E_BUDGET", f"{action}: أكتر من {MAX_CONTINUATIONS} استكمال")
 
     def _one(self, body: bytes, action: str) -> dict:
+        sent_id = json.loads(body.decode("utf-8")).get("request_id")
         problem = ""
         internal_retries = 0
         for attempt in range(len(RETRY_WAITS) + 1):
@@ -99,6 +100,12 @@ class Client:
                 answer = json.loads(text)
             except ValueError:
                 raise ApiError("E_NOT_JSON", text[:200]) from None
+            # رد ناجح لازم يرجّع نفس request_id. اتشاف في P4: Google ساعات بترجّع رد doGet (ping) بدل doPost بعد الـ
+            # redirect — يعني نتيجة الطلب مش معروفة، فبنعيده بنفس الـ id (السيرفر بيرجّع النتيجة الأصلية لو كان اتنفّذ)
+            if answer.get("ok") is True and sent_id and answer.get("request_id") != sent_id:
+                problem = "E_SHAPE: answer is not for this request"
+                self.attempts_log.append({"action": action, "attempt": attempt + 1, "problem": problem})
+                continue
             if answer.get("ok") is True:
                 return answer
             code = answer.get("code") or "E_UNKNOWN"

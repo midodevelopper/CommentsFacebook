@@ -183,6 +183,11 @@ Live progress is in `dumps/plan-exec/state.json`; the final outcome is written h
   - SHA-256 of the production namespace's property dump;
   - Drive `modifiedTime`.
   All three must be equal. Rehearsal never writes production, and reads don't change `modifiedTime`.
+- **Correction found in P3 (2026-10-24):**
+  - Pushing code to the bound script, or creating versions and deployments, bumps the spreadsheet's Drive
+    `modifiedTime`: 10:13 → 14:44 UTC, while a full CSV export stayed byte-identical to P0's.
+  - So `modifiedTime` is **not** a data-change signal around script operations. The production-unchanged proof and
+    the P5 drain use `snapshot_hash` and the view-export comparison. `modifiedTime` is recorded only as context.
 
 ### 3.3 Deployment model and cut-over (findings 2, 3)
 - **Before the cut-over, no versioned deployment changes.**
@@ -1010,7 +1015,7 @@ Google behaviour; classes G and F do, within their limits.
 
 | ID | Requirement | Availability (2026-10-24) | Verified how | Resolution | Blocks |
 |---|---|---|---|---|---|
-| B1 | clasp authorized as the owner; Apps Script API on; scriptId; deployment inventory | ✅ [V3] auth, [V2] inventory | P0 `show-authorized-user`, `list-deployments` | re-login by the owner if it expires (default scopes only) | P3+ if lost |
+| B1 | clasp authorized as the owner; Apps Script API on; scriptId; deployment inventory | ⚠️ **partly open (found in P3, 2026-10-24):** auth, scriptId and inventory OK, but `clasp push` → HTTP 403 "User has not enabled the Apps Script API". Reads (list, clone) work without the user setting; writes don't. Rev. 2/3's "API enabled" was inferred from reads, which was wrong. | P3 push; a failed push changes nothing (verified: HEAD/v5/v6 still equal the repo) | owner turns on https://script.google.com/home/usersettings with the owner account, then P3 resumes at the push | **P3–P8** |
 | B2 | Drive connector can copy, search, trash and read metadata | ✅ [V2] metadata; copy not yet exercised | P0 metadata; P3 first copy | if copy fails → `blocked: B2` before any production change | P3+ |
 | B3 | Logged-in Facebook session | unknown (browser off) | P0/P6 CDP + `c_user` | `start-cdp-browser.cmd`, login | P6, P7 only |
 | B4 | Offline toolchain | ✅ [V2] | P0 suite | — | E–PX |

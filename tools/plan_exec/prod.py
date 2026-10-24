@@ -96,7 +96,7 @@ def cmd_push(args) -> int:
 
 def cmd_version(args) -> int:
     c = gas.Clasp()
-    n = gas.ensure_version(c, f"cf-v2-{args.run}")
+    n = gas.ensure_version(c, f"cf-v2-{args.run}" + (f"-{args.label}" if args.label else ""))
     data = ids()
     data["v2_version"] = n
     save_ids(data)
@@ -186,6 +186,7 @@ def main(argv=None) -> int:
     for name in ("push", "version", "rehearsal-deploy", "repoint"):
         s = sub.add_parser(name)
         s.add_argument("--run", default="")
+        s.add_argument("--label", default="")
     sub.add_parser("deployments")
     sub.add_parser("restore-head")
     s = sub.add_parser("api")

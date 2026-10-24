@@ -298,6 +298,7 @@ function writeBuild_(sheet, built) {
   all.setNumberFormat('@');
   sheet.getRange(1, 1, 1, width).setValues([built.head]);
   if (built.rows.length) {
+    prepareTypedColumns_(sheet, headerMapFrom_(built.head), 2, built.rows.length);
     sheet.getRange(2, 1, built.rows.length, width).setValues(built.rows.map(r => r.map(safeText_)));
     sheet.getRange(2, 1, built.rows.length, width).setNotes(built.notes);
     ['created_time', 'received_at'].forEach(h => {
@@ -308,6 +309,13 @@ function writeBuild_(sheet, built) {
 }
 
 // التحقق: كل صف وكل خلية في الشيت المبني = التحويل المتوقع من v1 (التواريخ كلحظات UTC)
+function headerMapFrom_(head) {
+  const map = {};
+  head.forEach((h, i) => { if (map[h] === undefined) map[h] = i; });
+  map._width = head.length;
+  return map;
+}
+
 function compareBuild_(sheet, built) {
   const issues = [];
   const head = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0].map(String);
@@ -322,7 +330,7 @@ function compareBuild_(sheet, built) {
       for (let c = 0; c < built.head.length; c++) {
         const want = built.rows[r][c], got = vals[r][c];
         const same = want instanceof Date ? (got instanceof Date && got.getTime() === want.getTime())
-          : typeof want === 'boolean' ? (got === want || String(got).toUpperCase() === String(want).toUpperCase())
+          : typeof want === 'boolean' ? got === want
           : String(got) === String(want);
         if (!same) { issues.push(`row ${r + 2} ${built.head[c]}`); break; }
         if (String(notes[r][c] || '') !== String(built.notes[r][c] || '')) { issues.push(`note row ${r + 2} ${built.head[c]}`); break; }
@@ -337,7 +345,8 @@ function setStepState_(ctx, tab, name, value) { nsSet_(ctx.ns, `MIG.${tab}.${nam
 
 function faultAfter_(ctx, step) {
   if (!ctx.fault || ctx.fault.after_step !== step) return;
-  if (ctx.fault.mode === 'throw') throw new ApiErr('E_INTERNAL', `fault injected after ${step}`);
+  // كود مش قابل للإعادة: العميل مايعيدش لوحده، فالتجربة بتختبر الاستكمال الصريح
+  if (ctx.fault.mode === 'throw') throw new ApiErr('E_FAULT', `fault injected after ${step}`);
 }
 
 function migrateTab_(ctx, run, tab, done) {
@@ -428,7 +437,7 @@ function convergeSheet_(target, source, ctx, faultStep) {
   old.clearContent(); old.clearNote(); old.clearDataValidations(); old.clearFormat();
   if (ctx && ctx.fault && ctx.fault.after_step === faultStep + ':partial') {
     source.getRange(1, 1, Math.min(rows, 10), cols).copyTo(target.getRange(1, 1));
-    throw new ApiErr('E_INTERNAL', 'fault injected in the middle of converge');
+    throw new ApiErr('E_FAULT', 'fault injected in the middle of converge');
   }
   source.getRange(1, 1, rows, cols).copyTo(target.getRange(1, 1));
 }
@@ -504,11 +513,17 @@ function actionFormat_(ctx) {
     head.forEach(h => {
       const col = sh.getRange(2, map[h] + 1, maxRows - 1, 1);
       if (h === 'created_time' || h === 'received_at') col.setNumberFormat('yyyy-mm-dd hh:mm').setHorizontalAlignment('center');
-      else if (h === 'is_reply' || h === 'reply_status') col.setHorizontalAlignment('center');
+      else if (h === 'is_reply') col.setNumberFormat('General').setHorizontalAlignment('center');
+      else if (h === 'reply_status') col.setHorizontalAlignment('center');
       else col.setNumberFormat('@');
       if (WRAP.indexOf(h) !== -1) col.setWrap(true);
     });
-    if (map.is_reply !== undefined) sh.getRange(2, map.is_reply + 1, last - 1, 1).insertCheckboxes();
+    if (map.is_reply !== undefined) {
+      const col = sh.getRange(2, map.is_reply + 1, last - 1, 1);
+      col.setNumberFormat('General');
+      col.setValues(col.getValues().map(r => [r[0] === true || String(r[0]).toUpperCase() === 'TRUE']));
+      col.insertCheckboxes();
+    }
     const rule = SpreadsheetApp.newDataValidation().requireValueInList(STATUSES, true).setAllowInvalid(false).build();
     sh.getRange(2, map.reply_status + 1, last - 1, 1).setDataValidation(rule);
     const band = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=ISEVEN(ROW())').setBackground('#F9FAFB')
@@ -536,8 +551,8 @@ function activityFormula_(ss) {
     const c = h => `${tab}!${colLetter_(m[h])}2:${colLetter_(m[h])}`;
     const id = c(idCol);
     return `IFERROR(FILTER({IF(LEN(${id}),"${kind}",""),${id},${c('group_id')},${c('group_name')}&" · "&${c('group_id')},` +
-      `${c('created_time')},INT(${c('created_time')}),WEEKDAY(${c('created_time')},2),TEXT(${c('created_time')},"dddd"),` +
-      `INT(${c('received_at')}),IF(${c('reply_status')}="","(none)",${c('reply_status')})},LEN(${id})),{"","","","","","","","","",""})`;
+      `${c('created_time')},TEXT(${c('created_time')},"yyyy-mm-dd"),WEEKDAY(${c('created_time')},2),TEXT(${c('created_time')},"dddd"),` +
+      `TEXT(${c('received_at')},"yyyy-mm-dd"),IF(${c('reply_status')}="","(none)",${c('reply_status')})},LEN(${id})),{"","","","","","","","","",""})`;
   };
   return `={"kind","id","group_id","group_label","created_at","created_date","weekday_no","weekday","received_date","reply_status";` +
     `${part(POSTS, pm, 'post', 'post_id')};${part(COMMENTS, cm, 'comment', 'comment_id')}}`;
@@ -585,16 +600,17 @@ function actionBuildDashboard_(ctx) {
     s.setTitle(label);
     return {column: col, label: label};
   });
-  const notEmpty = SpreadsheetApp.newFilterCriteria().whenCellNotEmpty().build();
+  // فلاتر الـ pivot على نطاق عادي لازم تبقى قوائم قيم (مرئية/مخفية): شروط النص بترفضها Google
+  // («لا يمكن للشرط المنطقي تطبيق التحقّق…» — اتشاف في تجربة P4 على شيت حقيقي)
+  // وكمان «قيم مرئية بس» (setHiddenValues مرفوضة): الصفوف الفاضية بتتشال بفلتر kind = post/comment
   const pivots = PIVOTS.map((p, i) => {
     const anchor = dash.getRange(30, 1 + i * 4);
     anchor.offset(-1, 0).setValue(p.title).setFontWeight('bold');
     const pt = anchor.createPivotTable(source);
     const group = pt.addRowGroup(p.rowCol);
     pt.addPivotValue(2, SpreadsheetApp.PivotTableSummarizeFunction.COUNTA);
-    pt.addFilter(2, notEmpty);
-    if (p.kind) pt.addFilter(1, SpreadsheetApp.newFilterCriteria().whenTextEqualTo(p.kind).build());
-    if (p.replyOnly) pt.addFilter(10, SpreadsheetApp.newFilterCriteria().whenTextNotEqualTo('(none)').build());
+    pt.addFilter(1, SpreadsheetApp.newFilterCriteria().setVisibleValues(p.kind ? [p.kind] : ['post', 'comment']).build());
+    if (p.replyOnly) pt.addFilter(10, SpreadsheetApp.newFilterCriteria().setVisibleValues(STATUSES.slice()).build());
     if (p.top) group.sortBy(pt.getPivotValues()[0], []).sortDescending();
     if (p.rowCol === 7) group.sortAscending();
     const chart = dash.newChart().setChartType(Charts.ChartType[p.chart]).addRange(dash.getRange(30, 1 + i * 4, p.top ? p.top + 1 : 400, 2))
@@ -670,8 +686,10 @@ function actionCheckDashboard_(ctx) {
     const sample = expectedCounts_(ss, null);
     const group = Object.keys(sample.posts_by_group)[0];
     if (group && slicers.length >= 3) {
-      const s = slicers.find(x => x.getColumnPosition() === 4);
-      s.setColumnFilterCriteria(4, SpreadsheetApp.newFilterCriteria().whenTextEqualTo(group).build());
+      const s = slicers[2];   // بترتيب الإنشاء: received date، weekday، group
+      // فلاتر الـ slicer بالقيم المخفية بس (Google: «القيم المرئية غير متاحة حاليًا»)
+      const hide = Object.keys(sample.posts_by_group).filter(g => g !== group);
+      s.setColumnFilterCriteria(4, SpreadsheetApp.newFilterCriteria().setHiddenValues(hide).build());
       SpreadsheetApp.flush();
       const filtered = compare(expectedCounts_(ss, {group: group}));
       s.setColumnFilterCriteria(4, null);
@@ -743,6 +761,32 @@ function actionDeleteEmptyTab_(ctx) {
   return {deleted: true};
 }
 
+// الاسترجاع من ملف نسخة احتياطية (Backup A) جوه الملف الأصلي: التاب بيتنسخ مؤقت، والأصل (نفس الـ gid) يتساوى بيه،
+// والنسخة المؤقتة تتمسح بالعلامة. المصدر لازم يكون في قايمة السماح (قراءة بس كفاية). الـ deployment مابيتغيرش.
+function actionRestoreTabFrom_(ctx) {
+  const source = String(ctx.payload.source || '');
+  const tab = String(ctx.payload.tab || '');
+  if ([POSTS, COMMENTS].indexOf(tab) === -1) throw new ApiErr('E_VALIDATION', 'tab must be Posts or Comments');
+  const entry = allowlist_()[source];
+  if (!entry || entry.expires < Date.now() || source === ctx.ssId) throw new ApiErr('E_TARGET_NOT_ALLOWED', 'source not allowlisted');
+  const srcSheet = SpreadsheetApp.openById(source).getSheetByName(tab);
+  const target = ctx.ss.getSheetByName(tab);
+  if (!srcSheet || !target) throw new ApiErr('E_SCHEMA', `${tab} missing in source or target`);
+  const marker = `restore:${tab}:${ctx.req.request_id}`;
+  let temp = findMarked_(ctx.ss, marker);
+  if (!temp) {
+    temp = srcSheet.copyTo(ctx.ss);
+    temp.setName(`__restore_${tab}_${Date.now()}`);
+    temp.addDeveloperMetadata(MARKER, marker);
+    temp.hideSheet();
+  }
+  const want = contentHash_(temp);
+  if (contentHash_(target) !== want) convergeSheet_(target, temp, ctx, `restore:${tab}`);
+  if (contentHash_(target) !== want) throw new ApiErr('E_INTERNAL', `${tab} restore did not match the backup`);
+  if (marked_(temp, marker)) ctx.ss.deleteSheet(temp);
+  return {tab: tab, restored: true, gid: target.getSheetId(), content: want};
+}
+
 function actionRepairCheck_(ctx) {
   const intact = verifyChain_(ctx);
   if (intact) {
@@ -769,5 +813,6 @@ const SETUP_ACTIONS = {
   check_dashboard: {auth: 'admin', target: 'write', lock: true, schema: SCHEMA_V2, run: actionCheckDashboard_},
   verify: {auth: 'admin', target: 'read', lock: true, run: actionVerify_},
   delete_empty_tab: {auth: 'admin', target: 'write', lock: true, run: actionDeleteEmptyTab_},
+  restore_tab_from: {auth: 'admin', target: 'write', lock: true, replay: true, run: actionRestoreTabFrom_},
   repair_check: {auth: 'admin', target: 'write', lock: true, run: actionRepairCheck_}
 };

@@ -172,6 +172,12 @@ def scripted(responses, seen):
         if isinstance(item, Exception):
             raise item
         status, body = item
+        try:  # like the real server: a success answer echoes the request_id (unless the test wants otherwise)
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("ok") is True and "request_id" not in parsed:
+                body = json.dumps(dict(parsed, request_id=seen[-1]["request_id"]))
+        except ValueError:
+            pass
         if status >= 400:
             raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(body.encode()))
         return FakeResp(status, body)
@@ -270,3 +276,15 @@ def test_cli_start_refuses_out_of_order_and_records_progress(tmp_path, capsys):
     assert data["phases"]["B0"]["state"] == "passed" and data["phases"]["E"]["state"] == "running"
     assert cli(["report"], base=tmp_path) == 0
     assert (tmp_path / f"report-{data['run_id']}.md").exists()
+
+
+def test_client_retries_an_answer_that_is_not_for_this_request():
+    """Seen in P4: after the web-app redirect Google sometimes returned the doGet ping instead of the doPost result.
+    The outcome is unknown, so the client asks again with the same request_id instead of treating it as success."""
+    seen = []
+    ping = json.dumps({"ok": True, "api_version": 2, "schema_version": "1", "request_id": None})
+    c = clientmod.Client("https://x/exec", "k", sleep=lambda s: None,
+                         opener=scripted([(200, ping), (200, json.dumps({"ok": True, "result": {"done": 1}}))], seen))
+    answer = c.call("migrate_step", request_id="m-1")
+    assert answer["result"] == {"done": 1} and len(seen) == 2
+    assert {s["request_id"] for s in seen} == {"m-1"}

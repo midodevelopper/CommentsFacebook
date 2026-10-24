@@ -313,7 +313,10 @@ def test_sheet_post_payload_does_not_send_author_url_or_content_kind():
 # ---------------------------------------------------------------- sheet_post transport (real loopback HTTP)
 
 def env_body(**extra):
-    return dict({"api_version": 2, "action": "ingest", "auth": {"kind": "ingest", "key": "k"}, "payload": {}}, **extra)
+    return dict({"api_version": 2, "request_id": "r1", "action": "ingest", "auth": {"kind": "ingest", "key": "k"}, "payload": {}}, **extra)
+
+
+OK1 = '{"ok":true,"request_id":"r1","posts_new":1}'
 
 
 @pytest.fixture
@@ -323,15 +326,38 @@ def sheet(http_server, monkeypatch):
 
 
 def test_sheet_post_sends_utf8_json_post_with_a_request_id(sheet):
-    sheet.respond(body='{"ok":true,"posts_new":1}')
+    sheet.respond(body='{"ok":true,"request_id":"fixed","posts_new":1}')
+    body = env_body(text="عربي 🌙")
+    del body["request_id"]
+    with pytest.raises(SystemExit):           # the generated id does not match the canned answer -> unknown outcome
+        scraper.sheet_post(dict(body))
+    sheet.requests.clear()
+    sheet.respond(body=OK1)
     answer = scraper.sheet_post(env_body(text="عربي 🌙"))
-    assert answer == '{"ok":true,"posts_new":1}'
+    assert answer == OK1
     req = sheet.requests[-1]
     assert req["method"] == "POST" and req["path"] == "/exec"
     assert req["headers"]["Content-Type"] == "application/json"
     assert "عربي 🌙".encode("utf-8") in req["body"]          # ensure_ascii=False
     body = json.loads(req["body"])
-    assert body["text"] == "عربي 🌙" and re.fullmatch(r"[0-9a-f-]{36}", body["request_id"])
+    assert body["text"] == "عربي 🌙" and body["request_id"] == "r1"
+
+
+def test_sheet_post_generates_a_request_id_when_missing(sheet, no_sleep):
+    sheet.respond(body=OK1)
+    body = env_body()
+    del body["request_id"]
+    with pytest.raises(SystemExit):
+        scraper.sheet_post(body)
+    assert re.fullmatch(r"[0-9a-f-]{36}", json.loads(sheet.requests[0]["body"])["request_id"])
+
+
+def test_sheet_post_retries_an_answer_that_is_not_for_this_request(sheet, no_sleep):
+    """P4: a doGet ping came back for a POST. That is not proof the rows were written: ask again, same id."""
+    sheet.queue(body='{"ok":true,"api_version":2,"schema_version":"2"}')
+    sheet.queue(body=OK1)
+    assert scraper.sheet_post(env_body()) == OK1
+    assert len(sheet.requests) == 2 and sheet.requests[0]["body"] == sheet.requests[1]["body"]
 
 
 def test_sheet_post_stops_when_apps_script_says_not_ok(sheet):
@@ -386,8 +412,8 @@ def test_sheet_post_http_5xx_retried_then_systemexit(sheet, no_sleep):
 
 def test_sheet_post_5xx_then_success_reuses_the_request_id(sheet, no_sleep):
     sheet.queue(status=500, body="<html>We're sorry, a server error occurred.</html>", content_type="text/html")
-    sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
-    assert scraper.sheet_post(env_body()) == '{"ok":true,"posts_new":1}'
+    sheet.queue(status=200, body=OK1)
+    assert scraper.sheet_post(env_body()) == OK1
     assert len(sheet.requests) == 2 and sheet.requests[0]["body"] == sheet.requests[1]["body"]
     assert no_sleep == [5]
 
@@ -396,8 +422,8 @@ def test_sheet_post_5xx_then_success_reuses_the_request_id(sheet, no_sleep):
 def test_sheet_post_transient_404_and_429_are_retried(sheet, no_sleep, status):
     """Seen in RUN6: Google answered 404 «يتعذر فتح الملف في الوقت الحالي» after 110 good requests."""
     sheet.queue(status=status, body="<html>عذرًا، يتعذر فتح الملف في الوقت الحالي.</html>", content_type="text/html")
-    sheet.queue(status=200, body='{"ok":true,"posts_new":1}')
-    assert scraper.sheet_post(env_body()) == '{"ok":true,"posts_new":1}'
+    sheet.queue(status=200, body=OK1)
+    assert scraper.sheet_post(env_body()) == OK1
     assert len(sheet.requests) == 2 and no_sleep == [5]
 
 
@@ -410,8 +436,8 @@ def test_sheet_post_4xx_not_retried(sheet, no_sleep):
 
 def test_sheet_post_busy_lock_retried(sheet, no_sleep):
     sheet.queue(body='{"ok":false,"code":"E_LOCK_BUSY","error":"script lock busy"}')
-    sheet.queue(body='{"ok":true}')
-    assert scraper.sheet_post(env_body()) == '{"ok":true}'
+    sheet.queue(body=OK1)
+    assert scraper.sheet_post(env_body()) == OK1
     assert no_sleep == [5]
 
 

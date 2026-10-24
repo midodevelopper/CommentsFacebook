@@ -206,7 +206,7 @@ function replayable_(ctx, action) {
   ensureCapacity_(store, store.getLastRow() + 1);
   store.getRange(store.getLastRow() + 1, 1, 1, 4).setValues([[id, ctx.req.action, nowIso_(), text]]);
   if (ctx.fault && ctx.fault.mode === 'drop_response' && ctx.fault.after_step === ctx.req.action) {
-    throw new ApiErr('E_INTERNAL', 'fault: response dropped after success');
+    throw new ApiErr('E_FAULT', 'fault: response dropped after success');
   }
   return result;
 }
@@ -245,9 +245,24 @@ function requireV2Headers_(sh, head) {
   return map;
 }
 
+// صفوف بتتضاف تحت خلية checkbox بتورث الـ checkbox وقيمتها FALSE (اتشاف في تجربة P4 على شيت حقيقي) — وده بيخلّي
+// getLastRow يقفز لآخر الـ grid والإضافة الجاية تنزل بعد مئات الصفوف الفاضية. فبنمسح الموروث فورًا.
 function ensureCapacity_(sh, lastRowNeeded) {
   const max = sh.getMaxRows();
-  if (lastRowNeeded > max) sh.insertRowsAfter(max, lastRowNeeded - max + 500);
+  if (lastRowNeeded <= max) return;
+  const add = lastRowNeeded - max + 500;
+  sh.insertRowsAfter(max, add);
+  const fresh = sh.getRange(max + 1, 1, add, sh.getMaxColumns());
+  fresh.clearDataValidations();
+  fresh.clearContent();
+}
+
+// booleans في خلية '@' بتتحفظ نص «TRUE» (شيت حقيقي): عمود is_reply لازم يبقى General قبل الكتابة
+function prepareTypedColumns_(sh, map, first, count) {
+  if (map.is_reply !== undefined) sh.getRange(first, map.is_reply + 1, count, 1).setNumberFormat('General');
+  ['created_time', 'received_at'].forEach(h => {
+    if (map[h] !== undefined) sh.getRange(first, map[h] + 1, count, 1).setNumberFormat('yyyy-mm-dd hh:mm');
+  });
 }
 
 function colLetter_(index0) {
@@ -401,6 +416,7 @@ function upsertRows_(ctx, sh, head, idCol, items, kind) {
     ensureCapacity_(sh, first + fresh.length - 1);
     const range = sh.getRange(first, 1, fresh.length, map._width);
     range.setNumberFormat('@');
+    prepareTypedColumns_(sh, map, first, fresh.length);
     range.setValues(fresh);
     applyRowFormats_(sh, map, head, first, fresh.length);
   }

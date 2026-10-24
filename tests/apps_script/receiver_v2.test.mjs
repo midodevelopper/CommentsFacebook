@@ -817,3 +817,35 @@ test('scale: a synthetic sheet shaped like production migrates and verifies', ()
   const ing = r.ingest({ group_id: G, posts: [newPost('901', [newComment('951', '901')])] });
   assert.equal(ing.ok, true, JSON.stringify(ing));
 });
+
+test('restore: a tab is restored from an allowlisted backup file into the same gid', () => {
+  const r = loadV2();
+  const f = rehearsal(r);
+  const backup = r.app.addFile('backup-1', 'CF-backup-run');
+  v1Fixture(backup);
+  r.call('allow_target', { target_id: 'backup-1', mode: 'ro' }, { target: PROD });
+  const v1 = JSON.stringify(backup.getSheetByName('Comments').table());
+  r.call('migrate_step', { run: 'run-test-1' }, { target: R });
+  assert.notEqual(JSON.stringify(f.getSheetByName('Comments').table()), v1);
+  const out = r.call('restore_tab_from', { source: 'backup-1', tab: 'Comments' }, { target: R });
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(JSON.stringify(f.getSheetByName('Comments').table()), v1);
+  assert.equal(f.getSheetByName('Comments').getSheetId(), 2107666404);
+  assert.equal(f.getSheets().filter(s => s.getName().startsWith('__restore_')).length, 0);
+  assert.equal(r.call('restore_tab_from', { source: 'not-allowed', tab: 'Comments' }, { target: R }).code, 'E_TARGET_NOT_ALLOWED');
+});
+
+test('ingest: rows added below formatted checkboxes do not inherit FALSE and appends stay contiguous', () => {
+  const r = migrated();
+  r.call('format', {}, { target: PROD });
+  const cs = r.ss.getSheetByName('Comments');
+  cs.maxRows = cs.getLastRow();
+  r.ingest({ group_id: G, posts: [newPost('901', [newComment('951', '901')])] });
+  const afterFirst = cs.getLastRow();
+  r.ingest({ group_id: G, posts: [newPost('901', [newComment('952', '901')])] });
+  assert.equal(cs.getLastRow(), afterFirst + 1);
+  const head = cs.table()[0];
+  assert.equal(String(cs.getRange(afterFirst + 1, head.indexOf('comment_id') + 1).getValue()), '952');
+  assert.equal(rowOf(r.ss, 'Comments', 'comment_id', '952').is_reply, false);
+  assert.equal(typeof rowOf(r.ss, 'Comments', 'comment_id', '304').is_reply, 'boolean');
+});

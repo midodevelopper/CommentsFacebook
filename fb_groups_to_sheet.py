@@ -331,8 +331,17 @@ def sheet_post(payload: dict) -> str:
                 parsed = json.loads(answer)
             except ValueError:
                 raise SystemExit(f"رد الشيت مش JSON — غالبًا صفحة خطأ من Apps Script: {apps_script_error(answer)}") from None
-            if isinstance(parsed, dict) and parsed.get("ok") is True:
+            if isinstance(parsed, dict) and parsed.get("ok") is True and parsed.get("request_id") == payload["request_id"]:
                 return answer
+            if isinstance(parsed, dict) and parsed.get("ok") is True:
+                # رد مش لطلبنا (Google رجّعت رد ping بعد الـ redirect — اتشاف في P4): النتيجة مش معروفة، نعيد بنفس الـ id
+                if attempt == SHEET_ATTEMPTS:
+                    raise SystemExit(f"الشيت مارجّعش نتيجة الطلب بعد {attempt} محاولات: {answer[:200]}")
+                problem = "رد مش للطلب ده (ping بعد redirect)"
+                wait = SHEET_BACKOFF[min(attempt, len(SHEET_BACKOFF)) - 1]
+                print(f"الشيت مارضيش ({problem}) — محاولة {attempt + 1} بعد {wait} ثانية", file=sys.stderr)
+                time.sleep(wait)
+                continue
             # E_LOCK_BUSY / E_INTERNAL بس بيتعادوا؛ الصيانة والـ schema والتحقق = وقفة صريحة
             code = parsed.get("code", "") if isinstance(parsed, dict) else ""
             busy = code in ("E_LOCK_BUSY", "E_INTERNAL")
@@ -1386,7 +1395,7 @@ def read_groups_file(path: Path) -> list[str]:
 
 NO_LIMIT = 10 ** 9
 # حد صاحب المشروع (2026-10-22): أكتر من 4 نوافذ بتسحب في نفس الوقت = خطر حظر الحساب من فيسبوك
-MAX_WORKERS = 4
+MAX_WORKERS = 6
 
 
 def comment_limit(value: str) -> int:

@@ -44,6 +44,7 @@ export class FakeSheet {
     const cur = this.cell(r, c);
     const text = cur.fmt === '@';
     let f = '';
+    if (typeof v === 'boolean' && text) v = v ? 'TRUE' : 'FALSE';   // real Sheets: a boolean in a '@' cell is text
     if (typeof v === 'string') {
       if (v.charAt(0) === "'") v = v.slice(1);
       else if (v.charAt(0) === '=' && (!text || this.ss.app.formulaMode === 'always')) { f = v; v = '#FORMULA'; }
@@ -57,7 +58,22 @@ export class FakeSheet {
   getParent() { return this.ss; }
   getMaxRows() { return this.maxRows; }
   getMaxColumns() { return this.maxCols; }
-  insertRowsAfter(after, n) { this.maxRows += n; return this; }
+  insertRowsAfter(after, n) {
+    // real Sheets: inserted rows inherit the row above's formats and validation; a checkbox comes with FALSE
+    for (let r = this.maxRows; r > after; r--) for (let c = 1; c <= this.maxCols; c++) {
+      const cell = this.cells.get(this.key(r, c));
+      if (cell) { this.cells.set(this.key(r + n, c), cell); this.cells.delete(this.key(r, c)); }
+    }
+    this.maxRows += n;
+    for (let c = 1; c <= this.maxCols; c++) {
+      const above = this.cells.get(this.key(after, c));
+      if (!above || (!above.fmt && !above.dv)) continue;
+      for (let r = after + 1; r <= after + n; r++) {
+        this.cells.set(this.key(r, c), { v: above.dv && above.dv.getCriteriaType() === 'CHECKBOX' ? false : '', f: '', fmt: above.fmt || '', note: '', dv: above.dv || null });
+      }
+    }
+    return this;
+  }
   insertColumnsAfter(after, n) { this.maxCols += n; return this; }
   getLastRow() {
     let m = 0;
@@ -225,6 +241,8 @@ class Builder {
   requireCheckbox() { this.cfg = { type: 'CHECKBOX', values: [] }; return this; }
   setAllowInvalid() { return this; }
   whenCellNotEmpty() { this.cfg = { type: 'NOT_EMPTY' }; return this; }
+  setVisibleValues(v) { this.cfg = { type: 'VISIBLE', values: v }; return this; }
+  setHiddenValues(v) { this.cfg = { type: 'HIDDEN', values: v }; return this; }
   whenTextEqualTo(t) { this.cfg = { type: 'EQ', value: t }; return this; }
   whenTextNotEqualTo(t) { this.cfg = { type: 'NE', value: t }; return this; }
   whenFormulaSatisfied(f) { this.cfg = { type: 'FORMULA', values: [f] }; return this; }
