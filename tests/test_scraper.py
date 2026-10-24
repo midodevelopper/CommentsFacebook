@@ -127,12 +127,15 @@ def test_cid_re_anchored_to_parameter_boundary():
     "عرض المزيد من التعليقات", "عرض التعليقات السابقة", "عرض المزيد من الردود", "عرض كل الردود",
     "عرض الردود", "عرض 12 من الردود", "عرض 3 رد", "View more comments", "View previous comments",
     "View more replies", "View all 14 replies", "View 1 reply", "View 2 replies",
+    # live 2026-10-24: none of these matched before, so those reply threads were never opened
+    "عرض رد واحد", "عرض ردين", "عرض ٣ ردود", "عرض ١٢ ردًا", "عرض كل الردود البالغ عددها ١٢", "عرض الرد",
+    "عرض التعليقات المخفية", "View hidden comments",
 ])
 def test_expand_re_matches_expanders(text):
     assert scraper.EXPAND_RE.search(text)
 
 
-@pytest.mark.parametrize("text", ["رد", "Reply", "إعجاب", "Like"])
+@pytest.mark.parametrize("text", ["رد", "Reply", "إعجاب", "Like", "عرض الترجمة", "عرض المزيد"])
 def test_expand_re_does_not_match_reply_or_like(text):
     assert not scraper.EXPAND_RE.search(text)
 
@@ -146,11 +149,18 @@ def test_sort_regexes():
 
 
 def test_module_regex_constants_are_not_used_by_code():
-    """Characterization: EXPAND_RE / NEWEST_RE / SORT_OPEN_RE are defined but the code
-    re-declares the same patterns inline (JS strings and local re.compile)."""
+    """Characterization: NEWEST_RE / SORT_OPEN_RE are defined but the code re-declares the same patterns inline
+    (local re.compile). EXPAND_RE is used since 2026-10-24: expand_comments sends it to JS as EXPAND_JS, because
+    its two inline copies had drifted and missed «عرض رد واحد» / «عرض ردين»."""
     source = (ROOT / "fb_groups_to_sheet.py").read_text(encoding="utf-8")
-    for name in ("EXPAND_RE", "NEWEST_RE", "SORT_OPEN_RE"):
+    for name in ("NEWEST_RE", "SORT_OPEN_RE"):
         assert source.count(name) == 1, name
+    assert source.count("EXPAND_JS") >= 3
+
+
+def test_expand_pattern_has_no_backslash_d_for_js():
+    """In JS (no u flag) a digit class is ASCII only; Facebook writes Arabic-Indic digits."""
+    assert r"\d" not in scraper.EXPAND_JS
 
 
 # ---------------------------------------------------------------- normalize_comment
@@ -1063,6 +1073,14 @@ def test_max_comments_rejects_words_other_than_all(monkeypatch):
     with pytest.raises(SystemExit):
         parse(monkeypatch, "--group", "https://www.facebook.com/groups/1", "--min-posts", "1",
               "--max-posts", "20", "--min-comments", "0", "--max-comments", "many")
+
+
+def test_workers_limit_is_six(monkeypatch):
+    """Owner raised the cap from 4 to 6 on 2026-10-24; more is still refused."""
+    assert scraper.MAX_WORKERS == 6
+    assert parse(monkeypatch, *BASE, "--workers", "6").workers == 6
+    with pytest.raises(SystemExit, match="workers"):
+        parse(monkeypatch, *BASE, "--workers", "7")
 
 
 def test_workers_cannot_combine_with_debug(monkeypatch):

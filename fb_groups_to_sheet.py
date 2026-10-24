@@ -86,12 +86,16 @@ UNAVAILABLE_RE = re.compile(r"هذا المحتوى غير متوفر حاليً
 # جروب خاص والحساب مش عضو: مفيش موجز خالص، بس زرار «انضمام»
 PRIVATE_RE = re.compile(r"مجموعة\s*\u200f?\s*خاصة|Private group")
 JOIN_RE = re.compile(r"انضمام إلى المجموعة|Join group")
+# أزرار «عرض المزيد» للتعليقات والردود — نفس النمط بيتبعت لـ JS (EXPAND_JS)، فمفيش \d: في JS دي أرقام
+# إنجليزي بس. فيسبوك بيكتب «عرض رد واحد» و«عرض ردين» و«عرض ٣ ردود» — النمط القديم ماكانش بيمسك ولا واحد
+# منهم، فالردود دي ماكانتش بتتفتح (اتشاف 2026-10-24 على منشور حقيقي)
 EXPAND_RE = re.compile(
-    r"(عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|"
-    r"عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|"
-    r"View more comments|View previous comments|View more replies|"
-    r"View all \d+ replies|View \d+ repl)"
+    r"(عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض التعليقات المخفية|"
+    r"عرض (?:\S+ )*?(?:رد|ردين|ردود|ردًا|ردا|الرد|الردود)(?=\s|$)|"
+    r"View more comments|View previous comments|View hidden comments|See hidden comments|"
+    r"View more replies|View all [0-9,]+ replies|View [0-9,]+ repl)"
 )
+EXPAND_JS = EXPAND_RE.pattern
 NEWEST_RE = re.compile(r"^(الأحدث|Newest)\b")
 SORT_OPEN_RE = re.compile(r"^(الأكثر ملاءمة|كل التعليقات|الأحدث|Most relevant|All comments|Newest)\b")
 
@@ -494,6 +498,16 @@ def feed_post_ids(page, group_id: str) -> list[str]:
 # موجز فاضي بيتعاد تحميله مرة: في RUN6 جروب نشط (17.5 ألف عضو، منشور من 16 دقيقة) طلع 0 منشورات لأن الموجز
 # ماترسمش في الوقت والـ CPU عند 100% مع 4 نوافذ — وبعدها بشوية نفس الصفحة كان فيها منشورات عادي
 FEED_ATTEMPTS = 2
+# بعد أول منشور فيسبوك بيجيب الدفعة اللي بعدها لما الصفحة توصل لآخرها: اتقاس 2026-10-24 ~4 ث بنافذة واحدة
+# (والمنشور الأول نفسه ~6 ث بعد الـ 4 ث بتوع البداية)، وأكتر مع نوافذ كتير. الحد القديم (1.8 ث × 6 لفّات فاضية)
+# كان بيقف بمنشور واحد في 131 من 208 جروب في تشغيل بـ 8 نوافذ. الانتظار بيخلص أول ما منشور جديد يظهر، فده
+# مابيبطّأش الموجز اللي بيحمّل بسرعة — بس آخر الموجز الحقيقي بقى بياخد ~24 ث بدل ~11.
+FEED_SCROLL_WAIT_MS = 4000
+FEED_STALE_ROUNDS = 6
+# الصفحة طولت (فيسبوك بيرسم الدفعة الجاية) = مش آخر الموجز حتى لو لسه مفيش رابط منشور جديد
+FEED_GROWTH_PX = 300
+# سقف عشان صفحة بتطول على طول من غير منشورات (اقتراحات مثلًا) ماتلفّش للأبد
+FEED_MAX_ROUNDS = 150
 
 
 def collect_post_ids(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
@@ -537,19 +551,24 @@ def _scroll_feed(page, group_id: str, max_posts: int) -> tuple[list[str], str]:
     )
     ids: list[str] = []
     stale = 0
-    while len(ids) < max_posts and stale < 6:
+    height = 0
+    for _ in range(FEED_MAX_ROUNDS):
         before = len(ids)
         for post_id in feed_post_ids(page, group_id):
             if post_id not in ids:
                 ids.append(post_id)
                 if len(ids) >= max_posts:
                     break
-        stale = stale + 1 if len(ids) == before else 0
-        if len(ids) >= max_posts:
+        grown = page.evaluate("() => document.documentElement.scrollHeight")
+        if len(ids) > before or grown > height + FEED_GROWTH_PX:
+            stale = 0
+        else:
+            stale += 1
+        height = max(height, grown)
+        if len(ids) >= max_posts or stale >= FEED_STALE_ROUNDS:
             break
         page.mouse.wheel(0, 2200)
-        # لحد ما منشور جديد يترسم (1.8 ث بالكتير زي الأول)
-        wait_until(page, lambda: any(p not in ids for p in feed_post_ids(page, group_id)), 1800)
+        wait_until(page, lambda: any(p not in ids for p in feed_post_ids(page, group_id)), FEED_SCROLL_WAIT_MS)
     return ids[:max_posts], label
 
 
@@ -801,9 +820,9 @@ def expand_comments(page, rounds: int = 30) -> int:
     for _ in range(rounds):
         before = comment_count(page)
         clicked = page.evaluate(
-            r"""() => {""" + POST_ROOT_JS + r"""
+            r"""(pattern) => {""" + POST_ROOT_JS + r"""
               const root = postRoot();
-              const wanted = /عرض المزيد من التعليقات|عرض التعليقات السابقة|عرض المزيد من الردود|عرض كل الردود|عرض الردود|عرض \d+ من الردود|عرض \d+ رد|عرض التعليقات المخفية|View more comments|View previous comments|View more replies|View all \d+ replies|View \d+ repl|View hidden comments|See hidden comments/;
+              const wanted = new RegExp(pattern);
               const buttons = [...root.querySelectorAll('[role="button"]')].filter(e => {
                 const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
                 return t && t !== 'رد' && t !== 'Reply' && wanted.test(t);
@@ -816,23 +835,26 @@ def expand_comments(page, rounds: int = 30) -> int:
                 n += 1;
               }
               return n;
-            }"""
+            }""", EXPAND_JS
         )
         if not clicked:
             page.mouse.wheel(0, 1400)
             more = lambda: bool(page.evaluate(  # noqa: E731
-                r"""() => {""" + POST_ROOT_JS + r"""
+                r"""(pattern) => {""" + POST_ROOT_JS + r"""
                   const root = postRoot();
-                  const wanted = /عرض المزيد من التعليقات|عرض الردود|عرض \d+ رد|عرض التعليقات المخفية|View more comments|View .*repl|View hidden comments|See hidden comments/;
-                  return [...root.querySelectorAll('[role="button"]')].some(e => wanted.test((e.textContent || '').replace(/\s+/g, ' ').trim()));
-                }"""
+                  const wanted = new RegExp(pattern);
+                  return [...root.querySelectorAll('[role="button"]')].some(e => {
+                    const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
+                    return t !== 'رد' && t !== 'Reply' && wanted.test(t);
+                  });
+                }""", EXPAND_JS
             ))
-            if not wait_until(page, more, 700):
+            if not wait_until(page, more, EXPAND_APPEAR_MS):
                 return total
             continue
         total += clicked
-        # لحد ما التعليقات/الردود اللي اتطلبت تترسم (1.1 ث بالكتير زي الأول)
-        wait_until(page, lambda: comment_count(page) > before, 1100)
+        # لحد ما التعليقات/الردود اللي اتطلبت تترسم
+        wait_until(page, lambda: comment_count(page) > before, EXPAND_RENDER_MS)
     return total
 
 
@@ -1076,6 +1098,14 @@ BRING_TO_FRONT = True
 GOTO_ATTEMPTS = 3
 # لقطات هيدر منشور من غير تعليقات، ثانية بين كل واحدة، لحد ما نوع المحتوى يبان
 HEADER_ROUNDS = 8
+# انتظارات التعليقات (2026-10-24): كانت 0.7 ث بعد التمرير و 0.7 لظهور «عرض المزيد» و 1.1 لرسم اللي اتطلب —
+# مع نوافذ كتير التحميل بياخد أكتر، وآخر القايمة كان بيتقرر بعد لفّتين فاضيين (~3 ث). كلهم بيخلصوا أول ما
+# الجديد يترسم، فالتكلفة بس على آخر القايمة (~4 ث للّفة الفاضية بدل ~1.5).
+COMMENT_SCROLL_WAIT_MS = 2500
+EXPAND_APPEAR_MS = 1500
+EXPAND_RENDER_MS = 2500
+# لفّات فاضية ورا بعض قبل ما نقول خلصت، حتى لو التمرير لسه بيتحرك (زي الأول)
+COMMENT_STALE_ROUNDS = 5
 
 
 # تسجيل خروج أو checkpoint = مشكلة في الحساب نفسه، مش في الجروب. التشغيل كله بيقف (كل الـ workers)،
@@ -1184,6 +1214,8 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
     # لحد ما النوع يبان. منشور فيه نص بيخلص من أول لقطة؛ الانتظار بيبقى بس لمنشور مالوش نص ولا ميديا لسه.
     # لقطة واحدة ماكانتش كفاية (D-36)، و 3 كمان لأ: فيديو من غير وصف اترسم بعد أكتر من 3 ثواني (D-41).
     no_comments = sort_state in NO_COMMENT_STATES
+    # عداد فيسبوك تحت المنشور (بالردود): لو لسه شايفين أقل منه، آخر القايمة مابيتقررش بعد لفّتين فاضيين بس
+    expected = None if no_comments else comment_total(page)
     for round_no in range(HEADER_ROUNDS if no_comments else 400):
         if len(order) >= limit:
             break
@@ -1230,11 +1262,12 @@ def scrape_post(page, group_id: str, post_id: str, min_comments: int, max_commen
             stale += 1
         shown = comment_count(page)
         moved = scroll_comment_pane(page)
-        # لحد ما تعليقات جديدة تترسم بعد التمرير (0.7 ث بالكتير زي الأول)
-        wait_until(page, lambda: comment_count(page) > shown, 700)
+        # لحد ما تعليقات جديدة تترسم بعد التمرير
+        wait_until(page, lambda: comment_count(page) > shown, COMMENT_SCROLL_WAIT_MS)
         # آخر القايمة: مفيش «عرض المزيد» والتمرير ماتحركش — لفّتين كفاية مش 5
-        # (5 لفّات فاضية أخدت ~150 ثانية على منشور واحد في تشغيل حقيقي)
-        if stale >= 5 or (stale >= 2 and not expanded and not moved):
+        # (5 لفّات فاضية أخدت ~150 ثانية على منشور واحد في تشغيل حقيقي)، إلا لو العداد لسه أكبر من اللي شفناه
+        short = expected is not None and len(order) < expected
+        if stale >= COMMENT_STALE_ROUNDS or (stale >= 2 and not expanded and not moved and not short):
             break
     if unsorted:
         total = comment_total(page)
@@ -1394,8 +1427,9 @@ def read_groups_file(path: Path) -> list[str]:
 
 
 NO_LIMIT = 10 ** 9
-# حد صاحب المشروع (2026-10-22): أكتر من 4 نوافذ بتسحب في نفس الوقت = خطر حظر الحساب من فيسبوك
-MAX_WORKERS = 4
+# حد صاحب المشروع: أكتر من 6 نوافذ بتسحب في نفس الوقت = خطر حظر الحساب من فيسبوك (كان 4 من 2026-10-22،
+# وصاحب المشروع رفعه لـ 6 في 2026-10-24). الحد ده لكل تشغيل: تشغيلين في نفس الوقت = ضعف النوافذ
+MAX_WORKERS = 6
 
 
 def comment_limit(value: str) -> int:

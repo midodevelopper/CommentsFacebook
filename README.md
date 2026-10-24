@@ -91,15 +91,15 @@ curl http://127.0.0.1:9333/json/version
 | `--group` | رابط جروب. كرّره لأكتر من جروب. من غيره: الجروبات من `groups.txt` |
 | `--min-posts` / `--max-posts` | حدود عدد المنشورات |
 | `--min-comments` / `--max-comments` | حدود عدد التعليقات للمنشور. `--max-comments all` = كل التعليقات |
-| `--workers` | كام جروب في نفس الوقت (1–4)، كل واحد في نافذة لوحده. **4 بالكتير** (خطر حظر الحساب) |
+| `--workers` | كام جروب في نفس الوقت (1–6)، كل واحد في نافذة لوحده. **6 بالكتير** (خطر حظر الحساب) — والحد ده للتشغيل كله: ماتشغّلش تشغيلين في نفس الوقت |
 | `--dry` | يحفظ JSON في `dumps/` بس، من غير إرسال للشيت |
 | `--batch-size` | أقصى عدد تعليقات في طلب واحد للشيت (افتراضي 200) |
 | `--cdp` | عنوان CDP (افتراضي `http://127.0.0.1:9333`) |
 
-تشغيل كبير (كل الجروبات، آخر 20 منشور، كل التعليقات، 4 نوافذ):
+تشغيل كبير (كل الجروبات، آخر 20 منشور، كل التعليقات، 6 نوافذ):
 
 ```powershell
-.venv\Scripts\python.exe fb_groups_to_sheet.py --min-posts 1 --max-posts 20 --min-comments 0 --max-comments all --workers 4
+.venv\Scripts\python.exe fb_groups_to_sheet.py --min-posts 1 --max-posts 20 --min-comments 0 --max-comments all --workers 6
 ```
 
 الإرسال للشيت بيحصل في الخلفية (السحب مابيستناش Apps Script)، وأي فشل في الإرسال بيوقف الجروب.

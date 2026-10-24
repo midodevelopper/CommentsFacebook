@@ -72,6 +72,9 @@ class Post:
     draft_guard: bool = True
     me_id: str = "100000000000777"        # the logged-in account (author of the replies we post)
     me_name: str = "أنا"
+    # live 2026-10-24: Facebook's Arabic reply expanders are «عرض رد واحد» / «عرض ردين» / «عرض ٣ ردود»
+    # (Arabic-Indic digits) — not «عرض 3 رد». "live" renders those; "digits" keeps the old fake label
+    replies_label: str = "digits"
     external_url: str | None = None
     video_src: str | None = None
     escape_closes: bool = False           # live 2026-10-21: Escape closes the post dialog -> facebook.com/
@@ -101,6 +104,11 @@ class Group:
     # counter («(20+) name | Facebook») once it has loaded
     name: str = ""
     title: str | None = None
+    # live 2026-10-24: the next chunk of the feed renders seconds after the page reaches its bottom; the page grows
+    # first (placeholders) and the post links come later. Here: every wheel grows the page by grow_px, and the next
+    # page_size cards appear only every wheels_per_page wheels
+    wheels_per_page: int = 1
+    grow_px: int = 0
 
 
 _CSS = """
@@ -122,7 +130,9 @@ const T = EN
      comment: 'Comment by ', replyBy: 'Reply by ', writeComment: 'Write a public comment…',
      writeReply: 'Write a public reply…'}
   : {relevant: 'الأكثر ملاءمة', all: 'كل التعليقات', newest: 'الأحدث', newestItem: 'الأحدث',
-     more: 'عرض المزيد من التعليقات', reply: 'رد', replies: n => `عرض ${n} رد`,
+     more: 'عرض المزيد من التعليقات', reply: 'رد',
+     replies: n => D.replies_label !== 'live' ? `عرض ${n} رد`
+       : n === 1 ? 'عرض رد واحد' : n === 2 ? 'عرض ردين' : `عرض ${n.toLocaleString('ar-EG')} ردود`,
      comment: 'تعليق بواسطة ', replyBy: 'رد بواسطة ', writeComment: 'اكتب تعليقًا عامًا...',
      writeReply: 'اكتب ردًا عامًا...'};
 const G = D.group_id, P = D.post_id;
@@ -383,10 +393,17 @@ function render() {
     main.append(a);
   }
   const spacer = document.createElement('div');
-  spacer.style.height = '4000px';
+  spacer.style.height = `${4000 + grown}px`;
   main.append(spacer);
 }
-document.addEventListener('wheel', () => { if (shown < D.post_ids.length) { shown += D.page_size; render(); } });
+let wheels = 0, grown = 0;
+document.addEventListener('wheel', () => {
+  if (shown >= D.post_ids.length) return;
+  wheels += 1;
+  grown += D.grow_px;
+  if (wheels % D.wheels_per_page === 0) shown += D.page_size;
+  render();
+});
 render();
 })();
 """

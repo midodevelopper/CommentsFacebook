@@ -92,6 +92,22 @@ def test_collect_scrolls_to_load_more(page, fake_fb):
     assert found == [str(3000 + i) for i in range(7)]
 
 
+def test_collect_keeps_scrolling_while_the_feed_page_grows(page, fake_fb):
+    """Live 2026-10-24: after the first post the next chunk renders seconds after the page reaches its bottom;
+    the old loop gave up after 6 rounds without a new link (131 of 208 groups ended with 1 post). The page
+    growing means Facebook is still rendering, so it is not the end of the feed."""
+    posts = [Post(str(3100 + i)) for i in range(6)]
+    fake_fb.add_group(Group(G, page_size=2, wheels_per_page=scraper.FEED_STALE_ROUNDS + 2, grow_px=500), posts)
+    found, _ = scraper.collect_post_ids(page, G, 6)
+    assert found == [p.post_id for p in posts]
+
+
+def test_collect_feed_waits_long_enough_per_scroll():
+    """Measured live 2026-10-24: ~4 s from reaching the bottom to the next chunk with one window."""
+    assert scraper.FEED_SCROLL_WAIT_MS >= 3500
+    assert scraper.FEED_SCROLL_WAIT_MS * scraper.FEED_STALE_ROUNDS >= 20000
+
+
 def test_collect_terminates_when_feed_is_exhausted(page, fake_fb):
     fake_fb.add_group(Group(G, page_size=2), [Post("1"), Post("2"), Post("3")])
     found, _ = scraper.collect_post_ids(page, G, 50)
@@ -277,6 +293,20 @@ def test_expand_opens_more_comments_and_reply_threads(page, fake_fb):
     article_ids = page.eval_on_selector_all("[role=article][data-cid]", "els => els.map(e => e.dataset.cid)")
     assert set(article_ids) == set(ids(cs)) | {"801", "802", "803"}
     assert page.get_by_role("button", name=re.compile("عرض")).count() == 0
+
+
+def test_expand_opens_facebooks_real_arabic_reply_labels(page, fake_fb):
+    """Live 2026-10-24: «عرض رد واحد» / «عرض ردين» / «عرض ٣ ردود» never matched, so those threads stayed shut."""
+    cs = comments(3)
+    cs[0].replies = [Comment(id="811")]
+    cs[1].replies = [Comment(id="821"), Comment(id="822")]
+    cs[2].replies = [Comment(id="831"), Comment(id="832"), Comment(id="833")]
+    open_post(page, fake_fb, Post("1", comments=cs, sort_mode="newest", replies_label="live"))
+    labels = page.eval_on_selector_all("[data-action=replies]", "els => els.map(e => e.textContent)")
+    assert labels == ["عرض رد واحد", "عرض ردين", "عرض ٣ ردود"]
+    scraper.expand_comments(page, rounds=30)
+    article_ids = page.eval_on_selector_all("[role=article][data-cid]", "els => els.map(e => e.dataset.cid)")
+    assert set(article_ids) == set(ids(cs)) | {"811", "821", "822", "831", "832", "833"}
 
 
 def test_expand_never_clicks_reply_buttons(page, fake_fb):
@@ -794,6 +824,37 @@ def test_scrape_post_stops_early_at_end_of_list(page, fake_fb, monkeypatch):
     out = scrape(page, fake_fb, Post("77", comments=comments(4)))
     assert out["comments_found"] == 4
     assert len(calls) == 3                      # 1 round with new comments + 2 empty
+
+
+def test_scrape_post_end_of_list_waits_longer_while_the_counter_says_more(page, fake_fb, monkeypatch):
+    """Facebook's counter under the post says 10 but 4 are visible: not the end after two empty rounds."""
+    calls = []
+    real = scraper.visible_snapshot
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(scraper, "scroll_comment_pane", lambda p: False)
+    monkeypatch.setattr(scraper, "expand_comments", lambda p, rounds=1: 0)
+    monkeypatch.setattr(scraper, "comment_total", lambda p: 10)
+    out = scrape(page, fake_fb, Post("77", comments=comments(4)))
+    assert out["comments_found"] == 4
+    assert len(calls) == 1 + scraper.COMMENT_STALE_ROUNDS
+
+
+def test_scrape_post_end_of_list_stays_short_when_the_counter_is_reached(page, fake_fb, monkeypatch):
+    calls = []
+    real = scraper.visible_snapshot
+    monkeypatch.setattr(scraper, "visible_snapshot", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(scraper, "scroll_comment_pane", lambda p: False)
+    monkeypatch.setattr(scraper, "expand_comments", lambda p, rounds=1: 0)
+    monkeypatch.setattr(scraper, "comment_total", lambda p: 4)
+    scrape(page, fake_fb, Post("77", comments=comments(4)))
+    assert len(calls) == 3
+
+
+def test_scrape_post_captures_replies_behind_real_arabic_labels(page, fake_fb):
+    cs = comments(3)
+    cs[2].replies = [Comment(id="880000000000011"), Comment(id="880000000000012")]
+    out = scrape(page, fake_fb, Post("77", comments=cs, replies_label="live"))
+    assert out["replies_found"] == 2 and out["comments_found"] == 5
 
 
 def test_scrape_post_keeps_going_while_scrolling_moves(page, fake_fb, monkeypatch):
